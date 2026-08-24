@@ -107,6 +107,9 @@ impl ServiceClient {
             Arc::new(ArcSwapOption::empty())
         };
 
+        gcp::install_federation_config(options.gcp_federation.clone())
+            .map_err(BuildError::GcpFederationConfig)?;
+
         Ok(Self::new(
             HttpClient::from_options(&options.http),
             LambdaClient::from_options(&options.lambda, assume_role_cache_mode),
@@ -125,6 +128,8 @@ impl ServiceClient {
 pub enum BuildError {
     #[error("Failed to read request identity private key: {0}")]
     SigningPrivateKeyReadError(#[from] request_identity::v1::SigningPrivateKeyReadError),
+    #[error("{0}")]
+    GcpFederationConfig(String),
 }
 
 impl ServiceClient {
@@ -177,8 +182,11 @@ impl ServiceClient {
                         let impersonate = auth
                             .impersonate_service_account()
                             .map(|b| b.as_ref());
+                        let wif_provider = auth
+                            .workload_identity_provider()
+                            .map(|b| b.as_ref());
                         let token = gcp
-                            .mint(impersonate, &audience)
+                            .mint(wif_provider, impersonate, &audience)
                             .await
                             .map_err(|e| ServiceClientError::GcpAuth(uri.clone(), e))?;
 

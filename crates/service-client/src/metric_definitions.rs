@@ -16,6 +16,21 @@ pub(crate) const GCP_CREDENTIAL_BUILD_DURATION: &str =
 pub(crate) const GCP_TOKEN_MINTS: &str = "restate.service_client.gcp.token_mints.total";
 pub(crate) const GCP_CREDENTIALS_ACTIVE: &str = "restate.service_client.gcp.credentials.active";
 
+/// Incremented at `AwsSubjectTokenProvider::subject_token()`'s single exit. `google-cloud-auth`'s
+/// external-account refresh loop calls this on every federated credential refresh, so it is the
+/// only crate-external heartbeat of federated refresh activity available without upstream
+/// support: its success rate approximates federated refresh health, and its errors surface
+/// failures in the AWS hop (broker credential fetch and SigV4 signing) specifically, ahead of the
+/// STS exchange and impersonation steps that follow.
+pub(crate) const GCP_FEDERATION_SUBJECT_TOKENS: &str =
+    "restate.service_client.gcp.federation.subject_tokens.total";
+/// The per-provider twin of [`GCP_CREDENTIALS_ACTIVE`]: the population of shared federated
+/// external-account sources, one per WIF provider resource in `federated_sources`. Set on the same
+/// housekeeping tick as `GCP_CREDENTIALS_ACTIVE` and after each source build, so unbounded growth
+/// here (a leak, or providers accumulating instead of being evicted) is visible the same way.
+pub(crate) const GCP_FEDERATION_SOURCES_ACTIVE: &str =
+    "restate.service_client.gcp.federation.sources.active";
+
 pub(crate) const RESULT_SUCCESS: &str = "success";
 pub(crate) const RESULT_ERROR: &str = "error";
 
@@ -24,6 +39,14 @@ pub(crate) const MINT_OUTCOME_TIMEOUT: &str = "timeout";
 pub(crate) const MINT_OUTCOME_TRANSIENT_ERROR: &str = "transient_error";
 pub(crate) const MINT_OUTCOME_PERMANENT_ERROR: &str = "permanent_error";
 pub(crate) const MINT_OUTCOME_BUILD_ERROR: &str = "build_error";
+
+/// `token_mints.total`'s `mode` label: separates federated mint failures (the customer-facing
+/// misconfiguration surface for Cloud -- a wrong WIF provider or missing impersonation binding)
+/// from ordinary ADC-path failures, without log-diving. Deliberately not added to the build
+/// counters: a build failure is already distinguishable from its log record, and duplicating the
+/// dimension there buys nothing.
+pub(crate) const MINT_MODE_ADC: &str = "adc";
+pub(crate) const MINT_MODE_FEDERATED: &str = "federated";
 
 /// Label values only -- never audience, service account, endpoint, provider, or error text.
 /// Those are unbounded, and the credential registry these metrics describe is a small,
@@ -44,10 +67,11 @@ pub(crate) fn describe_metrics() {
     describe_counter!(
         GCP_TOKEN_MINTS,
         Unit::Count,
-        "Number of GCP ID-token mint attempts, by outcome: success, timeout, transient_error, \
-         permanent_error (the credential's own id_token() call failed), or build_error (the \
-         underlying credential itself could not be constructed -- counted once per failed caller,\
-         not once per build, since a single failed build fails every caller waiting on it)"
+        "Number of GCP ID-token mint attempts, by outcome (success, timeout, transient_error, \
+         permanent_error -- the credential's own id_token() call failed, or build_error -- the \
+         underlying credential itself could not be constructed, counted once per failed caller, \
+         not once per build, since a single failed build fails every caller waiting on it) and \
+         mode (adc or federated)"
     );
 
     describe_gauge!(
@@ -55,5 +79,17 @@ pub(crate) fn describe_metrics() {
         Unit::Count,
         "Number of GCP credentials currently cached. Approximate: moka evicts lazily, so this can \
          lag an actual eviction until the next housekeeping tick"
+    );
+
+    describe_counter!(
+        GCP_FEDERATION_SUBJECT_TOKENS,
+        Unit::Count,
+        "Number of AWS subject-token fetches for GCP workload identity federation, by result"
+    );
+
+    describe_gauge!(
+        GCP_FEDERATION_SOURCES_ACTIVE,
+        Unit::Count,
+        "Number of GCP workload identity federation external-account sources currently cached, one per provider"
     );
 }
