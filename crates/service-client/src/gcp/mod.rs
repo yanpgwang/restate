@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use metrics::{counter, gauge, histogram};
 use moka::future::Cache;
 use moka::ops::compute::Op;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use restate_core::{Handle, TaskKind};
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -53,8 +53,6 @@ use crate::metric_definitions::{
 
 #[cfg(any(test, feature = "test_util"))]
 use ahash::HashMap;
-#[cfg(any(test, feature = "test_util"))]
-use parking_lot::Mutex;
 
 mod federation;
 
@@ -179,14 +177,37 @@ struct CredentialRegistry {
     cache: Cache<IdTokenSpec, Arc<dyn IdTokenSource>>,
     ambient_source: RecoverableCell<google_cloud_auth::credentials::Credentials>,
     /// Per-provider federated external-account source cells (see
-    /// [`federation::external_account_source_slot`]). Lives here rather than as a module-level
-    /// static for exactly the reason `cache`/`ambient_source` do: a federated source's refresh
-    /// task is spawned on whichever task center's default runtime was current when it was built,
-    /// so reusing one across a task center replacement would strand its refresh task on the old,
-    /// now-dead runtime -- the same bug this registry's task-center-generation awareness fixes for
-    /// the ambient source.
-    federated_sources:
-        Cache<String, Arc<RecoverableCell<google_cloud_auth::credentials::Credentials>>>,
+    /// [`federation::external_account_source_slot`]), keyed by WIF provider resource name. Lives
+    /// here rather than as a module-level static for exactly the reason `cache`/`ambient_source`
+    /// do: a federated source's refresh task is spawned on whichever task center's default runtime
+    /// was current when it was built, so reusing one across a task center replacement would
+    /// strand its refresh task on the old, now-dead runtime -- the same bug this registry's
+    /// task-center-generation awareness fixes for the ambient source.
+    ///
+    /// Registry-lifetime map, deliberately NOT idle-evicted -- reversing an earlier version of
+    /// this field, which was a moka cache sharing `cache`'s time-to-idle policy. That was wrong:
+    /// this map is consulted only from *outer* construction (`federation::external_account_source`),
+    /// never by a steady-state mint against an already-built outer credential. An active
+    /// deployment's `IDTokenCredentials` clones its source credential out of the `RecoverableCell`
+    /// and holds that clone alive internally, invisible to this map -- so an idle timer here would
+    /// evict the (from its perspective unreferenced) slot after the old time-to-idle regardless of
+    /// whether the source was still in active use elsewhere. The next outer construction for the
+    /// same provider would then build a *second* source with its own refresh task, alongside the
+    /// still-live original -- two live refresh tasks per provider, repeatable via ordinary
+    /// deployment churn. A source's lifetime must dominate every outer credential that references
+    /// it, so it cannot be independently time-evicted; that's why `ambient_source` above is a bare
+    /// `RecoverableCell`, never a cache entry, and this field now follows the same rule.
+    ///
+    /// Cleanup instead comes entirely from the registry's own lifecycle: cardinality is bounded by
+    /// admin-admitted WIF providers per registry generation, and the whole map -- and every
+    /// source's refresh task with it -- dies when the registry does, on task center replacement
+    /// (`credential_registry`) or shutdown (`ClearRegistrySlotOnDrop`).
+    federated_sources: Mutex<
+        std::collections::HashMap<
+            String,
+            Arc<RecoverableCell<google_cloud_auth::credentials::Credentials>>,
+        >,
+    >,
     #[cfg(any(test, feature = "test_util"))]
     test_hooks: TestHooks,
 }
@@ -360,10 +381,9 @@ impl CredentialRegistry {
             crate::metric_definitions::describe_metrics();
 
             let cache = Cache::builder().time_to_idle(CACHE_TIME_TO_IDLE).build();
-            let federated_sources = Cache::builder().time_to_idle(CACHE_TIME_TO_IDLE).build();
 
             let housekeeping_cache = cache.clone();
-            let housekeeping_federated_sources = federated_sources.clone();
+            let housekeeping_self_weak = self_weak.clone();
             let clear_slot_on_drop = ClearRegistrySlotOnDrop {
                 registry: self_weak.clone(),
             };
@@ -376,10 +396,13 @@ impl CredentialRegistry {
                 loop {
                     interval.tick().await;
                     housekeeping_cache.run_pending_tasks().await;
-                    housekeeping_federated_sources.run_pending_tasks().await;
                     gauge!(GCP_CREDENTIALS_ACTIVE).set(housekeeping_cache.entry_count() as f64);
-                    gauge!(crate::metric_definitions::GCP_FEDERATION_SOURCES_ACTIVE)
-                        .set(housekeeping_federated_sources.entry_count() as f64);
+                    // federated_sources is a plain, never-evicted map (see that field's doc) --
+                    // nothing to drive here, just report its current size.
+                    if let Some(registry) = housekeeping_self_weak.upgrade() {
+                        gauge!(crate::metric_definitions::GCP_FEDERATION_SOURCES_ACTIVE)
+                            .set(registry.federated_sources.lock().len() as f64);
+                    }
                 }
             };
 
@@ -396,7 +419,7 @@ impl CredentialRegistry {
                 task_center: task_center.clone(),
                 cache,
                 ambient_source: RecoverableCell::new(),
-                federated_sources,
+                federated_sources: Mutex::new(std::collections::HashMap::new()),
                 #[cfg(any(test, feature = "test_util"))]
                 test_hooks: TestHooks::default(),
             }
@@ -1427,6 +1450,61 @@ mod tests {
             build_count.load(Ordering::SeqCst),
             1,
             "8 keys for one WIF provider must share exactly one external-account source build"
+        );
+    }
+
+    /// `federated_sources` must not evict a provider's shared source across idle time (F1): an
+    /// outer credential holds its source credential alive internally, invisible to this
+    /// registry-lifetime map, so if the map evicted idle entries the way an earlier version of it
+    /// briefly did, a second outer construction for the same provider -- reached well after the
+    /// first one, with the first outer credential still alive and in use -- would silently
+    /// rebuild a second, colliding source with its own refresh task. Proven by minting through the
+    /// same provider twice, with virtual time advanced well past the old moka cache's
+    /// `CACHE_TIME_TO_IDLE` in between, and checking the source build count stays at 1 -- the
+    /// ambient source (a bare `RecoverableCell`, never evicted) already has this lifetime
+    /// property; this mirrors it for the federated source.
+    #[restate_core::test(start_paused = true)]
+    async fn federated_source_is_reused_across_idle_time_while_referenced() {
+        let provider = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/no-evict-test";
+        let service_account = "sa@example.iam.gserviceaccount.com";
+        let build_count = Arc::new(AtomicUsize::new(0));
+        federation::install_federated_source_override_for_test(provider, {
+            let build_count = build_count.clone();
+            move || {
+                build_count.fetch_add(1, Ordering::SeqCst);
+                Ok(google_cloud_auth::credentials::Credentials::from(
+                    FakeCredentialsProvider::always(|| ProbeOutcome::Healthy),
+                ))
+            }
+        });
+
+        let client = GcpTokenClient::new();
+        let _ = client
+            .mint(
+                Some(provider),
+                Some(service_account),
+                "https://no-evict-first.example.com",
+            )
+            .await;
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+
+        // Simulate the first outer credential remaining alive and in active use for well past the
+        // old moka cache's CACHE_TIME_TO_IDLE (1 hour) -- that alone used to be enough to evict
+        // the slot and cause a second, colliding source build below.
+        tokio::time::advance(Duration::from_secs(3700)).await;
+
+        let _ = client
+            .mint(
+                Some(provider),
+                Some(service_account),
+                "https://no-evict-second.example.com",
+            )
+            .await;
+        assert_eq!(
+            build_count.load(Ordering::SeqCst),
+            1,
+            "a federated source must be reused across idle time while still referenced by a live \
+             outer credential, not rebuilt"
         );
     }
 

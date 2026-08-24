@@ -693,6 +693,8 @@ pub struct ServiceClientOptions {
     /// their `auth` block, via a shared AWS -> GCP workload identity federation broker. Unset by
     /// default: deployments requesting this authentication fail registration and mint with an
     /// actionable error until this block is configured.
+    ///
+    /// Since v1.7.7
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gcp_federation: Option<GcpFederationOptions>,
 }

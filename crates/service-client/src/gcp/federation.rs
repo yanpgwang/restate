@@ -44,7 +44,6 @@ use google_cloud_auth::credentials::subject_token::{
 };
 use google_cloud_auth::errors::SubjectTokenProviderError;
 use metrics::{counter, gauge};
-use moka::future::Cache;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::warn;
 
@@ -85,7 +84,7 @@ static FEDERATION_CONFIG: std::sync::OnceLock<GcpFederationOptions> = std::sync:
 /// tested without process-global state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigInstallOutcome {
-    /// No config was supplied; there is nothing to install.
+    /// No config was supplied and none is installed; there is nothing to do.
     NotRequested,
     /// Nothing is installed yet; `incoming` becomes the process-wide value.
     FirstInstall,
@@ -94,44 +93,80 @@ enum ConfigInstallOutcome {
     /// Differs from what's already installed. `[gcp-federation]` is not live-reloadable, so the
     /// already-installed value stays active.
     Differing,
+    /// A config was installed, but a later reload omitted the `[gcp-federation]` block entirely.
+    /// Removing the block on reload is a live-reload change like any other, and just as
+    /// unapplied: the installed value stays active until a restart.
+    RemovalIgnored,
 }
 
+/// Pure decision, independent of both [`FEDERATION_CONFIG`] and validation: whether `incoming`
+/// should install, and if not, why. Validating before deciding the outcome would run
+/// [`validate_broker_role_arn`]/[`validate_session_name`] against a `Differing` or
+/// `RemovalIgnored` value that is going to be discarded regardless of its own shape -- an invalid
+/// differing reload would then return `Err` and fail the caller (leader/service-client
+/// construction) a second time, the exact failure mode the warn-and-keep semantics below exist to
+/// avoid. So [`install_config`] calls this first, and only validates the `FirstInstall` case.
 fn decide_config_install(
     installed: Option<&GcpFederationOptions>,
     incoming: Option<&GcpFederationOptions>,
 ) -> ConfigInstallOutcome {
     match (installed, incoming) {
-        (_, None) => ConfigInstallOutcome::NotRequested,
+        (None, None) => ConfigInstallOutcome::NotRequested,
         (None, Some(_)) => ConfigInstallOutcome::FirstInstall,
         (Some(installed), Some(incoming)) if installed == incoming => {
             ConfigInstallOutcome::Unchanged
         }
         (Some(_), Some(_)) => ConfigInstallOutcome::Differing,
+        (Some(_), None) => ConfigInstallOutcome::RemovalIgnored,
     }
+}
+
+/// Names the `[gcp-federation]` fields that differ between `installed` and `incoming`, for the
+/// differing-reinstall warning below. Without this, a reload that changed only `session-name`
+/// logged as "broker-role-arn changed from X to X" -- accurate about nothing having changed on
+/// the field it named, and silent about the field that actually did.
+fn describe_config_diff(
+    installed: &GcpFederationOptions,
+    incoming: &GcpFederationOptions,
+) -> String {
+    let mut changes = Vec::new();
+    if installed.broker_role_arn != incoming.broker_role_arn {
+        changes.push(format!(
+            "broker-role-arn '{}' -> '{}'",
+            installed.broker_role_arn, incoming.broker_role_arn
+        ));
+    }
+    if installed.session_name != incoming.session_name {
+        changes.push(format!(
+            "session-name '{}' -> '{}'",
+            installed.session_name, incoming.session_name
+        ));
+    }
+    changes.join(", ")
 }
 
 /// Install the process-wide `[gcp-federation]` config. Every `ServiceClient` built from the same
 /// `ServiceClientOptions` calls this, including on every config live-reload (see
 /// [`FEDERATION_CONFIG`]'s doc for why a changed block after the first install cannot actually be
 /// applied): `None` is always a no-op; the first `Some` installs; an identical `Some` re-install is
-/// a no-op; a *differing* `Some` re-install is logged and otherwise ignored, keeping the original
-/// value active.
+/// a no-op; a *differing* `Some` re-install, or a reload that removes the block, is logged and
+/// otherwise ignored, keeping the original value active.
 ///
-/// Validates `config` before the first install, so an operator learns about a typo in
+/// Validates `config` only for a `FirstInstall`, so an operator learns about a typo in
 /// `broker-role-arn` or `session-name` at server startup rather than on the first federated
 /// invocation -- config errors here are always permanent, unlike the runtime failures
-/// `GcpAuthError` classifies as transient/permanent. A later, differing re-install is never
-/// validated: it's discarded regardless of its own shape.
+/// `GcpAuthError` classifies as transient/permanent. A `Differing` or `RemovalIgnored` reload is
+/// never validated, since it's discarded regardless of its own shape: validating it anyway would
+/// let an invalid differing reload return `Err` and fail the caller a second time, defeating the
+/// warn-and-keep semantics this function exists to provide (see [`decide_config_install`]).
 pub(crate) fn install_config(config: Option<GcpFederationOptions>) -> Result<(), String> {
-    if let Some(cfg) = &config {
-        validate_broker_role_arn(&cfg.broker_role_arn)?;
-        validate_session_name(&cfg.session_name)?;
-    }
-
     match decide_config_install(FEDERATION_CONFIG.get(), config.as_ref()) {
         ConfigInstallOutcome::NotRequested | ConfigInstallOutcome::Unchanged => {}
         ConfigInstallOutcome::FirstInstall => {
-            let _ = FEDERATION_CONFIG.set(config.expect("FirstInstall implies a config was given"));
+            let config = config.expect("FirstInstall implies a config was given");
+            validate_broker_role_arn(&config.broker_role_arn)?;
+            validate_session_name(&config.session_name)?;
+            let _ = FEDERATION_CONFIG.set(config);
         }
         ConfigInstallOutcome::Differing => {
             let installed = FEDERATION_CONFIG
@@ -139,11 +174,21 @@ pub(crate) fn install_config(config: Option<GcpFederationOptions>) -> Result<(),
                 .expect("Differing implies a config is already installed");
             let incoming = config.expect("Differing implies a config was given");
             tracing::warn!(
-                "[gcp-federation] configuration changed (broker-role-arn '{}' -> '{}') but this \
-                 block is not live-reloadable; the broker role active since process start \
-                 (broker-role-arn '{}') remains in use until the server is restarted",
+                "[gcp-federation] configuration changed ({}) but this block is not \
+                 live-reloadable; the configuration active since process start (broker-role-arn \
+                 '{}') remains in use until the server is restarted",
+                describe_config_diff(installed, &incoming),
                 installed.broker_role_arn,
-                incoming.broker_role_arn,
+            );
+        }
+        ConfigInstallOutcome::RemovalIgnored => {
+            let installed = FEDERATION_CONFIG
+                .get()
+                .expect("RemovalIgnored implies a config is already installed");
+            tracing::warn!(
+                "[gcp-federation] configuration block was removed, but this block is not \
+                 live-reloadable; the configuration active since process start (broker-role-arn \
+                 '{}') remains in use until the server is restarted",
                 installed.broker_role_arn,
             );
         }
@@ -506,15 +551,22 @@ struct SubjectTokenHeader {
     value: String,
 }
 
-/// The shared federated external-account source cache, keyed by WIF provider resource name: one
+/// The shared federated external-account source map, keyed by WIF provider resource name: one
 /// [`RecoverableCell`] per provider, each holding the shared credential every federated key
 /// targeting that provider clones. Owned by `CredentialRegistry` (see that struct's
 /// `federated_sources` field in `gcp/mod.rs`), not a module-level static here, since a source's
 /// refresh task is spawned on whichever task center's default runtime built it and so must be
 /// rebuilt, not reused, across a task center replacement -- the same reasoning that keeps the
 /// registry's outer `cache`/`ambient_source` there rather than in statics.
-type FederatedSources =
-    Cache<String, Arc<RecoverableCell<google_cloud_auth::credentials::Credentials>>>;
+///
+/// A plain map, not a moka cache with its own eviction: see the `federated_sources` field's doc
+/// for why a source's slot must never be independently time-evicted.
+type FederatedSources = parking_lot::Mutex<
+    std::collections::HashMap<
+        String,
+        Arc<RecoverableCell<google_cloud_auth::credentials::Credentials>>,
+    >,
+>;
 
 /// Assembles the federation chain for `spec` (whose `wif_provider` is `Some`) and returns the
 /// resulting [`IdTokenSource`]: broker credentials -> shared external-account source credential
@@ -567,16 +619,17 @@ pub(super) async fn build_federated_source(
 }
 
 /// Returns the [`RecoverableCell`] for `provider` in `sources`, creating an empty one on first
-/// reference.
+/// reference. `sources` never evicts entries (see the `federated_sources` field's doc in
+/// `gcp/mod.rs`), so once created a provider's cell lives for the owning registry's lifetime.
 pub(super) async fn external_account_source_slot(
     sources: &FederatedSources,
     provider: &str,
 ) -> Arc<RecoverableCell<google_cloud_auth::credentials::Credentials>> {
     sources
-        .entry_by_ref(provider)
-        .or_insert_with(std::future::ready(Arc::new(RecoverableCell::new())))
-        .await
-        .into_value()
+        .lock()
+        .entry(provider.to_owned())
+        .or_insert_with(|| Arc::new(RecoverableCell::new()))
+        .clone()
 }
 
 /// Returns `provider`'s shared external-account source credential from `sources`, building it on
@@ -592,7 +645,7 @@ async fn external_account_source(
         .get_or_build(boxed_external_account_source_build(provider.to_owned()))
         .await;
     if result.is_ok() {
-        gauge!(GCP_FEDERATION_SOURCES_ACTIVE).set(sources.entry_count() as f64);
+        gauge!(GCP_FEDERATION_SOURCES_ACTIVE).set(sources.lock().len() as f64);
     }
     result
 }
@@ -611,7 +664,7 @@ pub(super) async fn recover_federated_source_if_dead(sources: &FederatedSources,
         .await
     {
         Ok(true) => {
-            gauge!(GCP_FEDERATION_SOURCES_ACTIVE).set(sources.entry_count() as f64);
+            gauge!(GCP_FEDERATION_SOURCES_ACTIVE).set(sources.lock().len() as f64);
             // `provider_resource` is a log field, not a metric label -- see
             // GCP_FEDERATION_SOURCES_ACTIVE's doc for why the provider dimension never appears on
             // a metric.
@@ -1067,10 +1120,6 @@ mod federation_tests {
             super::ConfigInstallOutcome::NotRequested
         );
         assert_eq!(
-            super::decide_config_install(Some(&a), None),
-            super::ConfigInstallOutcome::NotRequested
-        );
-        assert_eq!(
             super::decide_config_install(None, Some(&a)),
             super::ConfigInstallOutcome::FirstInstall
         );
@@ -1081,6 +1130,30 @@ mod federation_tests {
         assert_eq!(
             super::decide_config_install(Some(&a), Some(&b)),
             super::ConfigInstallOutcome::Differing
+        );
+        assert_eq!(
+            super::decide_config_install(Some(&a), None),
+            super::ConfigInstallOutcome::RemovalIgnored
+        );
+    }
+
+    #[test]
+    fn describe_config_diff_names_only_the_changed_field() {
+        let a = fixture_config("arn:aws:iam::123456789012:role/A");
+        let mut session_changed = a.clone();
+        session_changed.session_name = "different-session".to_owned();
+
+        let diff = super::describe_config_diff(&a, &session_changed);
+        assert!(
+            diff.contains("session-name") && !diff.contains("broker-role-arn"),
+            "a session-name-only change must not also report broker-role-arn as changed: {diff}"
+        );
+
+        let b = fixture_config("arn:aws:iam::123456789012:role/B");
+        let diff = super::describe_config_diff(&a, &b);
+        assert!(
+            diff.contains("broker-role-arn") && !diff.contains("session-name"),
+            "a broker-role-arn-only change must not also report session-name as changed: {diff}"
         );
     }
 
@@ -1100,6 +1173,54 @@ mod federation_tests {
             "arn:aws:iam::123456789012:role/Different",
         )))
         .expect("a differing re-install must not fail the caller");
+    }
+
+    /// An invalid config on a *differing* reinstall must never reach validation at all (F2):
+    /// validating a value that's going to be discarded regardless of its own shape would let a
+    /// malformed live reload fail the caller a second time -- resurrecting the exact failure mode
+    /// the warn-and-keep semantics above exist to eliminate. Runs in its own nextest process (see
+    /// the differing-reinstall test above for why that matters).
+    #[test]
+    fn install_config_ignores_an_invalid_differing_reinstall() {
+        super::install_config(Some(fixture_config(
+            "arn:aws:iam::123456789012:role/Original",
+        )))
+        .expect("first install succeeds");
+
+        super::install_config(Some(super::GcpFederationOptions {
+            broker_role_arn: "not-an-arn".to_owned(),
+            session_name: "session".to_owned(),
+        }))
+        .expect("an invalid differing reload must not fail the caller");
+
+        assert_eq!(
+            super::FEDERATION_CONFIG
+                .get()
+                .map(|c| c.broker_role_arn.as_str()),
+            Some("arn:aws:iam::123456789012:role/Original"),
+            "the original config must remain installed after an invalid differing reload"
+        );
+    }
+
+    /// Removing the `[gcp-federation]` block on a live reload is an unapplied change too, exactly
+    /// like a differing value (F2 related) -- it must not be silently classified as
+    /// `NotRequested`, and the caller must not fail.
+    #[test]
+    fn install_config_ignores_a_block_removed_on_reload() {
+        super::install_config(Some(fixture_config(
+            "arn:aws:iam::123456789012:role/Original",
+        )))
+        .expect("first install succeeds");
+
+        super::install_config(None).expect("a removed block must not fail the caller");
+
+        assert_eq!(
+            super::FEDERATION_CONFIG
+                .get()
+                .map(|c| c.broker_role_arn.as_str()),
+            Some("arn:aws:iam::123456789012:role/Original"),
+            "the original config must remain installed after the block is removed on reload"
+        );
     }
 
     fn assume_role_access_denied_error() -> aws_credential_types::provider::error::CredentialsError
@@ -1163,28 +1284,26 @@ mod federation_tests {
         );
     }
 
-    /// A federated sources cache evicts idle entries (F2): there is no time-based eviction test to
-    /// mirror against the outer registry cache, so this instead proves the eviction mechanism
-    /// works by forcing it directly -- `Cache::invalidate` plus `run_pending_tasks` (moka evicts
-    /// lazily) -- and checking that the next lookup builds a genuinely new slot rather than
-    /// reusing the evicted one, the same observable effect real idle-timeout eviction would
-    /// produce. Builds its own local cache rather than reaching into `CredentialRegistry`'s: the
-    /// slot/eviction mechanism under test here is generic over any `FederatedSources` cache.
+    /// `federated_sources` is a plain, registry-lifetime map with no eviction (F1): unlike an
+    /// earlier version of this type (a moka cache sharing the outer registry cache's time-to-idle
+    /// policy), a provider's slot must survive indefinitely once created -- an outer credential
+    /// holds its source credential alive internally, invisible to this map, so idle-evicting the
+    /// slot while an outer credential built from it was still alive would silently rebuild a
+    /// second, colliding source next time the same provider was referenced. Proven structurally
+    /// here: two lookups for the same provider, with nothing in between, must return the exact
+    /// same slot; see `gcp::tests::federated_source_is_reused_across_idle_time_while_referenced`
+    /// for the end-to-end version through `mint()`.
     #[tokio::test]
-    async fn external_account_source_slot_is_rebuilt_after_cache_eviction() {
-        let provider = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/evict-test";
-        let sources: super::FederatedSources = moka::future::Cache::builder()
-            .time_to_idle(super::super::CACHE_TIME_TO_IDLE)
-            .build();
+    async fn external_account_source_slot_is_reused_on_every_lookup() {
+        let provider = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/reuse-test";
+        let sources: super::FederatedSources = Default::default();
 
         let first = super::external_account_source_slot(&sources, provider).await;
-        sources.invalidate(provider).await;
-        sources.run_pending_tasks().await;
         let second = super::external_account_source_slot(&sources, provider).await;
 
         assert!(
-            !Arc::ptr_eq(&first, &second),
-            "a new slot must be created after the cache entry is evicted"
+            Arc::ptr_eq(&first, &second),
+            "the same provider must always resolve to the same slot -- this map has no eviction"
         );
     }
 }

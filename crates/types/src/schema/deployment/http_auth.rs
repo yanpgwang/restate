@@ -128,15 +128,24 @@ impl GoogleIdTokenAuth {
 }
 
 /// Validates that `resource` has the shape
-/// `//iam.googleapis.com/projects/<project-number>/locations/<location>/workloadIdentityPools/<pool>/providers/<provider>`:
-/// a numeric project number and three identifier segments (letters, digits, `-`, `_`). Persisted
-/// verbatim into cache keys, SigV4 `SignedHeaders`, and the Google STS `audience` parameter, so an
-/// arbitrary string here is a functional bug waiting to happen, not just a cosmetic one.
+/// `//iam.googleapis.com/projects/<project-number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>`,
+/// matching Google's actual workload identity pool/provider creation contract as of this writing
+/// (`projects.locations.workloadIdentityPools[.providers].create`): the location must be `global`
+/// (the only location Google currently supports for workload identity pools -- there is no
+/// regional variant yet); pool and provider ids must be 4-32 characters of lowercase letters,
+/// digits, and hyphens; and the `gcp-` id prefix is reserved for Google's own use. Enforced
+/// strictly rather than loosely: a too-strict rejection if Google later adds regional pools or
+/// loosens the id charset is a one-line release-time fix, whereas accepting a name Google itself
+/// would reject lets an un-mintable typo persist into a deployment record that only fails later,
+/// with an opaque Google STS error, at the first mint attempt. Persisted verbatim into cache keys,
+/// SigV4 `SignedHeaders`, and the Google STS `audience` parameter, so an arbitrary string here is
+/// a functional bug waiting to happen, not just a cosmetic one.
 fn validate_provider_resource_name(resource: &str) -> Result<(), &'static str> {
-    let is_identifier = |s: &str| {
-        !s.is_empty()
+    let is_valid_id = |s: &str| {
+        (4..=32).contains(&s.len())
             && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !s.starts_with("gcp-")
     };
 
     let Some(rest) = resource.strip_prefix("//iam.googleapis.com/projects/") else {
@@ -160,9 +169,14 @@ fn validate_provider_resource_name(resource: &str) -> Result<(), &'static str> {
     if project.is_empty() || !project.bytes().all(|b| b.is_ascii_digit()) {
         return Err("project must be a numeric project number");
     }
-    if !is_identifier(location) || !is_identifier(pool) || !is_identifier(provider) {
+    if *location != "global" {
         return Err(
-            "location, workload identity pool, and provider must be non-empty identifiers (letters, digits, '-', '_')",
+            "location must be 'global': Google does not support regional workload identity pools",
+        );
+    }
+    if !is_valid_id(pool) || !is_valid_id(provider) {
+        return Err(
+            "workload identity pool and provider ids must be 4-32 characters of lowercase letters, digits, and hyphens, and must not use the reserved 'gcp-' prefix",
         );
     }
     Ok(())
@@ -260,7 +274,7 @@ mod tests {
         assert!(derive_audience(&parse("/discover")).is_none());
     }
 
-    const PROVIDER: &str = "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws";
+    const PROVIDER: &str = "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws-broker";
 
     #[test]
     fn new_enforces_provider_requires_impersonation() {
@@ -306,7 +320,14 @@ mod tests {
         for provider in [
             PROVIDER,
             "//iam.googleapis.com/projects/999999999999/locations/global/workloadIdentityPools/my-pool/providers/my-provider",
-            "//iam.googleapis.com/projects/1/locations/eu/workloadIdentityPools/p/providers/r",
+            // Exactly 4 characters: the minimum valid id length.
+            "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/aaaa/providers/bbbb",
+            // Exactly 32 characters: the maximum valid id length.
+            &format!(
+                "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/{}/providers/{}",
+                "a".repeat(32),
+                "b".repeat(32),
+            ),
         ] {
             provider_auth(provider)
                 .unwrap_or_else(|e| panic!("expected '{provider}' to be accepted, got {e}"));
@@ -318,22 +339,38 @@ mod tests {
         for provider in [
             "",
             "not-a-resource-name",
-            "iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws",
-            "//iam.googleapis.com/projects/abc/locations/global/workloadIdentityPools/pool/providers/aws",
-            "//iam.googleapis.com/projects//locations/global/workloadIdentityPools/pool/providers/aws",
-            "//iam.googleapis.com/projects/123/locations//workloadIdentityPools/pool/providers/aws",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools//providers/aws",
+            "iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws-broker",
+            "//iam.googleapis.com/projects/abc/locations/global/workloadIdentityPools/pool/providers/aws-broker",
+            "//iam.googleapis.com/projects//locations/global/workloadIdentityPools/pool/providers/aws-broker",
+            "//iam.googleapis.com/projects/123/locations//workloadIdentityPools/pool/providers/aws-broker",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools//providers/aws-broker",
             "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/",
-            "//iam.googleapis.com/projects/123/regions/global/workloadIdentityPools/pool/providers/aws",
-            "//iam.googleapis.com/projects/123/locations/global/pools/pool/providers/aws",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/endpoints/aws",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws/extra",
+            "//iam.googleapis.com/projects/123/regions/global/workloadIdentityPools/pool/providers/aws-broker",
+            "//iam.googleapis.com/projects/123/locations/global/pools/pool/providers/aws-broker",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/endpoints/aws-broker",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws-broker/extra",
             // Rejected only by the tightened per-segment identifier check: no `/` in these, so
             // the old segment-count-only parser accepted them.
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/has space/providers/aws",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/100%",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/caf\u{e9}",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool?/providers/aws",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/has space/providers/aws-broker",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/100%broker",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/caf\u{e9}-broker",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool?/providers/aws-broker",
+            // F3: Google supports only the `global` location for workload identity pools -- no
+            // regional pools exist yet.
+            "//iam.googleapis.com/projects/1/locations/eu/workloadIdentityPools/pool/providers/aws-broker",
+            // F3: ids shorter than 4 characters are not something Google will create.
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/abc",
+            // F3: ids longer than 32 characters are not something Google will create.
+            &format!(
+                "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/{}",
+                "a".repeat(33),
+            ),
+            // F3: uppercase is outside Google's [a-z0-9-] id charset.
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/Pool/providers/aws-broker",
+            // F3: underscore is outside Google's [a-z0-9-] id charset -- only hyphen is allowed.
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool_x/providers/aws_broker",
+            // F3: the `gcp-` id prefix is reserved for Google's own use.
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/gcp-reserved/providers/aws-broker",
         ] {
             let err = provider_auth(provider)
                 .expect_err(&format!("expected '{provider}' to be rejected"));
