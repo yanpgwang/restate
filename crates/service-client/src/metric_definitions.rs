@@ -26,14 +26,10 @@ pub(crate) const GCP_FEDERATION_SUBJECT_TOKENS: &str =
     "restate.service_client.gcp.federation.subject_tokens.total";
 /// The per-provider twin of [`GCP_CREDENTIALS_ACTIVE`]: the population of shared federated
 /// access-token sources, one per WIF provider resource in `federated_access_token_sources`. Set
-/// only on the registry's housekeeping tick, after that tick's own reap pass -- unlike
-/// `GCP_CREDENTIALS_ACTIVE`, there is no separate after-each-build update site any more: a
-/// provider's access-token source is weak-indexed and leased by every outer credential that
-/// references it, not time-evicted, so its count can only meaningfully change when housekeeping
-/// prunes dead leases, not on every build. Approximate for the same reason
-/// `GCP_CREDENTIALS_ACTIVE` is (and then some): an access-token source can go fully unreferenced
-/// and still count as active here until the next housekeeping tick reaps it, so this can lag an
-/// actual removal by up to one housekeeping interval.
+/// only on the registry's housekeeping tick -- unlike `GCP_CREDENTIALS_ACTIVE`, there is no
+/// separate after-each-build update site any more, since a source's weak-indexed, leased entry
+/// only meaningfully changes when housekeeping's reap pass observes it. Approximate: this can lag
+/// both new sources and removals by up to one housekeeping interval.
 pub(crate) const GCP_FEDERATION_SOURCES_ACTIVE: &str =
     "restate.service_client.gcp.federation.sources.active";
 
@@ -98,7 +94,7 @@ pub(crate) fn describe_metrics() {
         Unit::Count,
         "Number of GCP workload identity federation access-token sources currently live, one per \
          provider. Approximate: leased by outer credentials rather than time-evicted, and updated \
-         only on the housekeeping tick, so this can lag an actual removal by up to one \
-         housekeeping interval"
+         only on the housekeeping tick, so this can lag source additions and removals by up to \
+         one housekeeping interval"
     );
 }

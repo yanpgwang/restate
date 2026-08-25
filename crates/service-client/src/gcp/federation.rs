@@ -554,17 +554,9 @@ struct SubjectTokenHeader {
 }
 
 /// The shared Google STS access-token source for one WIF provider: the external-account
-/// credential produced by exchanging a SigV4-signed AWS subject token, before impersonation.
-///
-/// Lifetime is entirely reference-driven, not time-driven. Every [`FederatedIdTokenCredentials`]
-/// built for this provider holds an `Arc` to the *same* `FederatedAccessTokenSource` (see that
-/// type's `_access_token_source` field) for as long as it itself is cached; nothing here can
-/// observe that use directly, since `credentials.get_or_build()` hands back a *clone* of the
-/// underlying `Credentials` value, not a reference into this struct -- an earlier version of this
-/// type tried to track liveness with its own idle timer anyway, and that was wrong (see
-/// `FederatedAccessTokenSources`'s doc for why). So liveness is tracked the only way it validly
-/// can be: externally, by how many outer credentials still hold a strong `Arc` to this struct,
-/// via `Arc::strong_count`.
+/// credential produced by exchanging a SigV4-signed AWS subject token, before impersonation. Its
+/// lifetime is not owned by this struct -- see [`FederatedAccessTokenSources`] for the ownership
+/// model.
 ///
 /// Deliberately holds no reference back to `CredentialRegistry` or any task-center-bound state:
 /// `ClearRegistrySlotOnDrop`'s `Weak`-based shutdown guard (`gcp/mod.rs`) must stay cycle-free.
@@ -572,17 +564,18 @@ pub(super) struct FederatedAccessTokenSource {
     pub(super) credentials: RecoverableCell<google_cloud_auth::credentials::Credentials>,
 }
 
-/// Weak-indexed by WIF provider resource name. The map itself never holds a strong reference, so
-/// it never has anything to time out: [`federated_access_token_source`] upgrades an entry while
-/// it's live or replaces it (absent or dead) with a fresh one, and
-/// [`reap_disused_federated_access_token_sources`] prunes whatever no longer upgrades. This is the
-/// deliberate replacement for an earlier version of this map, which held `Arc<RecoverableCell<_>>`
-/// directly and depended on a moka time-to-idle policy to age out abandoned providers -- that was
-/// wrong because this map is only ever touched from *outer* construction, never from a
-/// steady-state mint against an already-built outer credential, so an idle timer here can't
-/// observe the very thing that keeps a source alive (an outer credential's own cloned copy of its
-/// `Credentials`). Weak-indexing sidesteps the whole problem: there is no independent timer to get
-/// wrong, only the true refcount.
+/// The shared, weak-indexed home for every WIF provider's [`FederatedAccessTokenSource`], keyed by
+/// provider resource name.
+///
+/// Lifetime is entirely reference-driven: this map holds only `Weak` entries, and every
+/// [`FederatedIdTokenCredentials`] built for a provider holds a strong `Arc` to that provider's
+/// source for as long as it itself stays cached (its `_access_token_source` field) --
+/// [`federated_access_token_source`] upgrades a live entry or replaces a dead/absent one, and
+/// [`reap_disused_federated_access_token_sources`] prunes whatever no longer upgrades. Time-based
+/// eviction can't substitute for this: this map is touched only from outer construction, never
+/// from a steady-state mint against an already-built outer credential, so an idle timer would have
+/// nothing to observe -- an outer credential's own cloned copy of its access-token `Credentials`
+/// is invisible to this map.
 ///
 /// NOT keyed on any AWS identity: this round adds no ambient-AWS federation (the broker identity
 /// stays the single process-global, install-once [`GcpFederationOptions`]), so the WIF provider
@@ -594,20 +587,14 @@ pub(super) struct FederatedAccessTokenSource {
 pub(super) type FederatedAccessTokenSources =
     parking_lot::Mutex<std::collections::HashMap<String, Weak<FederatedAccessTokenSource>>>;
 
-/// The outer, per-audience/service-account federated ID-token credential. Exists so the federated
-/// construction path cannot forget to keep its access-token source's lease alive: `Live` (used by
-/// the ambient/impersonated paths) has no such field, because the shared ambient source's lifetime
-/// is tracked by the registry itself, not by any individual outer credential -- but a federated
-/// access-token source's lifetime is tracked *entirely* by how many `FederatedIdTokenCredentials`
-/// still hold a strong `Arc` to it. Making this a distinct type rather than an optional field on
-/// `Live` makes omitting the lease a compile error in the federated path, not a runtime bug.
+/// The outer, per-audience/service-account federated ID-token credential. Holds a required lease
+/// on its provider's [`FederatedAccessTokenSource`] (see that type's doc for the ownership model)
+/// rather than an optional field on `Live`, so the federated construction path cannot compile
+/// without keeping it.
 pub(super) struct FederatedIdTokenCredentials {
     credentials: google_cloud_auth::credentials::idtoken::IDTokenCredentials,
-    // Keeps the Google STS access-token source and its refresh task alive for at least as long as
-    // this outer ID-token credential stays cached. Dropping this (when the outer moka cache
-    // evicts the entry this credential lives in) is what lets
-    // `reap_disused_federated_access_token_sources` observe that the access-token source has no
-    // more referents.
+    // See FederatedAccessTokenSources's doc: dropping this lease (when the outer moka cache
+    // evicts the entry this credential lives in) is what housekeeping's reap observes.
     _access_token_source: Arc<FederatedAccessTokenSource>,
 }
 

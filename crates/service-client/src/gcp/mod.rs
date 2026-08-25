@@ -178,39 +178,9 @@ struct CredentialRegistry {
     task_center: Handle,
     cache: Cache<IdTokenSpec, Arc<dyn IdTokenSource>>,
     ambient_source: RecoverableCell<google_cloud_auth::credentials::Credentials>,
-    /// Per-provider federated access-token sources (see [`federation::FederatedAccessTokenSource`]
-    /// and [`federation::FederatedAccessTokenSources`]), keyed by WIF provider resource name.
-    /// Lives here rather than as a module-level static for exactly the reason `cache`/
-    /// `ambient_source` do: a federated access-token source's refresh task is spawned on
-    /// whichever task center's default runtime was current when it was built, so reusing one
-    /// across a task center replacement would strand its refresh task on the old, now-dead
-    /// runtime -- the same bug this registry's task-center-generation awareness fixes for the
-    /// ambient source.
-    ///
-    /// Weak-indexed by provider, strongly leased by every cached outer
-    /// [`federation::FederatedIdTokenCredentials`]; reaped by housekeeping after the last lease
-    /// drops (see [`federation::reap_disused_federated_access_token_sources`]) -- not an
-    /// independent time-to-idle, which an earlier version of this field briefly was. That was
-    /// wrong: this map is consulted only from *outer* construction
-    /// (`federation::build_federated_source`), never by a steady-state mint against an
-    /// already-built outer credential, so a time-to-idle here has nothing to observe -- an outer
-    /// credential's own cloned copy of its access-token credentials is invisible to this map, so
-    /// idle-evicting a slot the way an independent TTI would have could strand a *second*,
-    /// colliding source with its own refresh task the next time the same provider was referenced,
-    /// while the first was still very much alive and in use via the outer credential.
-    ///
-    /// `TaskCenter` shutdown remains the unconditional upper bound on every access-token source's
-    /// lifetime regardless of leases: it kills the whole registry (`ClearRegistrySlotOnDrop`),
-    /// which owns this map, whose entries in turn own every access-token source's refresh task.
-    /// Cleanup below that bound may lag by up to one `CACHE_HOUSEKEEPING_INTERVAL`: an
-    /// access-token source can go fully unreferenced and still sit here, upgradable to nothing
-    /// useful, until the next housekeeping tick prunes it -- `gcp.federation.sources.active` is
-    /// documented as approximate for exactly that reason.
-    ///
-    /// Keyed on the WIF provider resource name alone, which is a sufficient key only because AWS
-    /// identity selection for federation stays process-global in this design (the single,
-    /// install-once broker in [`GcpFederationOptions`] -- no ambient-AWS federation exists yet). A
-    /// future per-deployment AWS identity choice would have to join this key.
+    /// Per-provider federated access-token sources, weak-indexed and leased by every cached outer
+    /// federated ID-token credential -- see [`federation::FederatedAccessTokenSources`] for the
+    /// ownership model.
     federated_access_token_sources: federation::FederatedAccessTokenSources,
     #[cfg(any(test, feature = "test_util"))]
     test_hooks: TestHooks,
@@ -352,7 +322,9 @@ impl Drop for ClearRegistrySlotOnDrop {
 /// process, not state tied to any one task center's runtime, and `BROKER` holds AWS credential
 /// state (an `AssumeRoleProvider` plus a cached session) with no background refresh task of its
 /// own -- neither has anything spawned onto a task center that could go stale when this registry
-/// rebuilds. `federated_access_token_sources` is different: see that field's doc.
+/// rebuilds. `federated_access_token_sources` is different: each source's refresh task is spawned
+/// on whichever task center built it, so it must rebuild -- not persist -- across a replacement
+/// too.
 fn credential_registry(task_center: &Handle) -> Result<Arc<CredentialRegistry>, String> {
     if let Some(slot) = REGISTRY.read().as_ref()
         && slot.task_center.ptr_eq(task_center)
@@ -1535,11 +1507,13 @@ mod tests {
         );
     }
 
-    /// Two distinct outer credentials for the same provider must lease the exact same
-    /// `FederatedAccessTokenSource`, proven by looking the provider up twice (once implicitly via
-    /// each outer construction, once explicitly on each side) and comparing pointers -- there is
-    /// only ever one access-token source per live provider, shared by every outer credential that
-    /// references it.
+    /// Two distinct outer credentials for the same provider must each hold their own strong lease
+    /// on the exact same access-token source -- not merely resolve to the same pointer, but keep
+    /// it alive by refcount. Captures the map's `Weak` entry directly (never
+    /// `federated_access_token_source`, which would hand back an extra strong `Arc` and inflate
+    /// the count under test) and follows `strong_count()` through 2 -> 1 -> 0 as each cached outer
+    /// credential is evicted in turn, proving the leases -- not this test -- are what keep it
+    /// alive.
     #[restate_core::test]
     async fn two_outer_credentials_for_one_provider_share_the_same_access_token_source() {
         let provider = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/shared-lease";
@@ -1561,33 +1535,56 @@ mod tests {
             provider,
             service_account,
         );
-        let outer_a =
-            federation::build_federated_source(&registry.federated_access_token_sources, spec_a)
-                .await
-                .expect("outer construction succeeds");
-        let outer_b =
-            federation::build_federated_source(&registry.federated_access_token_sources, spec_b)
-                .await
-                .expect("outer construction succeeds");
+        let outer_a = federation::build_federated_source(
+            &registry.federated_access_token_sources,
+            spec_a.clone(),
+        )
+        .await
+        .expect("outer construction succeeds");
+        let outer_b = federation::build_federated_source(
+            &registry.federated_access_token_sources,
+            spec_b.clone(),
+        )
+        .await
+        .expect("outer construction succeeds");
 
-        let lease_a = federation::federated_access_token_source(
-            &registry.federated_access_token_sources,
-            provider,
+        let weak = registry
+            .federated_access_token_sources
+            .lock()
+            .get(provider)
+            .cloned()
+            .expect("the builds above must have created an entry for this provider");
+
+        registry.cache.insert(spec_a.clone(), outer_a).await;
+        registry.cache.insert(spec_b.clone(), outer_b).await;
+        assert_eq!(
+            weak.strong_count(),
+            2,
+            "both cached outer credentials must hold their own lease on the shared source"
         );
-        let lease_b = federation::federated_access_token_source(
-            &registry.federated_access_token_sources,
-            provider,
+
+        registry.cache.invalidate(&spec_a).await;
+        registry.cache.run_pending_tasks().await;
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "evicting one outer credential must drop exactly its own lease"
         );
-        assert!(
-            Arc::ptr_eq(&lease_a, &lease_b),
-            "two outer credentials for the same provider must lease the exact same access-token \
-             source"
+
+        registry.cache.invalidate(&spec_b).await;
+        registry.cache.run_pending_tasks().await;
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "evicting the last outer credential must drop the last lease"
         );
-        let _ = (outer_a, outer_b);
     }
 
     /// Expiring one outer credential must not reap a still-shared access-token source while
-    /// another outer credential for the same provider keeps it alive.
+    /// another outer credential for the same provider keeps it alive. Moves the second outer
+    /// credential straight into the cache without retaining a local strong reference, so the
+    /// post-eviction check -- upgrading the map's own `Weak` -- can only succeed because the
+    /// CACHE itself, not this test, is holding the lease.
     #[restate_core::test]
     async fn expiring_one_outer_credential_does_not_reap_a_still_referenced_source() {
         let provider = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/still-referenced";
@@ -1616,10 +1613,10 @@ mod tests {
         .await
         .expect("outer construction succeeds");
         registry.cache.insert(spec_a.clone(), outer_a).await;
-        registry.cache.insert(spec_b, outer_b.clone()).await;
+        registry.cache.insert(spec_b, outer_b).await;
 
-        // Expire and evict only spec_a's outer entry; spec_b's stays cached and keeps its own
-        // strong reference to the shared access-token source alive via `outer_b`.
+        // Expire and evict only spec_a's outer entry; spec_b's stays cached, and only the CACHE
+        // still references the shared source from here on.
         registry.cache.invalidate(&spec_a).await;
         registry.cache.run_pending_tasks().await;
 
@@ -1641,7 +1638,6 @@ mod tests {
             "the shared access-token source must not be reaped while spec_b's outer credential \
              still references it"
         );
-        let _ = outer_b;
     }
 
     /// After the FINAL outer credential referencing a provider expires and is evicted, the
@@ -1882,12 +1878,11 @@ mod tests {
     /// by the first permanent mint failure on a key targeting that provider to probe it -- the
     /// federated analogue of `dead_ambient_source_is_replaced_after_permanent_impersonation_failure`.
     ///
-    /// Drives the outer credential through `LeasedMockSource` rather than a plain `MockSource`:
-    /// under the reference-driven model, a seeded-but-unreferenced access-token source is a
-    /// tombstone the instant the seeding call returns (nothing retains the `Arc` it briefly
-    /// created), so `recover_federated_access_token_source_if_dead` would find it already dead and
-    /// correctly no-op -- not a bug in recovery, but a test that needs an actual lease to mean
-    /// anything.
+    /// Drives the outer credential through `LeasedMockSource`, not a plain `MockSource`: a
+    /// seeded source with no real lease is already a dead tombstone by the time recovery runs
+    /// (see [`federation::FederatedAccessTokenSources`]'s doc for why), so recovery would
+    /// correctly no-op instead of replacing it -- not a bug, but a test that needs an actual
+    /// lease to mean anything.
     #[restate_core::test]
     async fn dead_federated_source_is_replaced_after_permanent_mint_failure() {
         let provider = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/recovery";
@@ -2384,15 +2379,12 @@ mod tests {
     /// future specifically so `TaskKind::Credentials`'s `OnCancel = "abort"` shutdown path drops
     /// it.
     ///
-    /// Extended with a federated key, reworked to go through the real construction path: an
-    /// earlier version of this test seeded a source slot directly and took a `Weak` from the
-    /// `Arc` that call happened to return -- but that `Arc` was only ever a local variable in the
-    /// test, so it died the moment the test dropped it, proving nothing about TaskCenter shutdown
-    /// at all. Under the current, reference-driven model the only thing that legitimately keeps
-    /// an access-token source alive is a cached outer `FederatedIdTokenCredentials`, so this
-    /// builds one for real (via `get_or_build`, the same path `mint()` uses) and inserts it into
-    /// the outer cache, then takes its `Weak` from the registry's own map -- the SAME weak entry
-    /// `reap_disused_federated_access_token_sources` would later prune, not an unrelated local.
+    /// Builds a real federated outer credential via `get_or_build` (the same path `mint()` uses)
+    /// and takes its access-token source's `Weak` from the registry's own map, rather than
+    /// seeding a source directly and taking a `Weak` from a locally-owned `Arc` -- that would
+    /// prove nothing about TaskCenter shutdown, only about the test's own variable going out of
+    /// scope (see [`federation::FederatedAccessTokenSources`]'s doc for why only a cached outer
+    /// credential's lease legitimately keeps a source alive).
     #[tokio::test(flavor = "multi_thread")]
     async fn registry_is_dropped_at_shutdown_not_at_the_next_mint() {
         use restate_core::{TaskCenterBuilder, TaskCenterFutureExt as _};
