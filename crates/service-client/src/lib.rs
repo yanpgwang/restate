@@ -24,6 +24,7 @@ use hyper::body::Body;
 use hyper::http::uri::PathAndQuery;
 use hyper::{HeaderMap, Response, Uri};
 
+use restate_core::Handle;
 use restate_types::config::ServiceClientOptions;
 use restate_types::deployment::HttpAuth;
 use restate_types::identifiers::LambdaARN;
@@ -83,9 +84,15 @@ impl ServiceClient {
         }
     }
 
+    /// `task_center` must be a handle captured by the caller while running inside `TaskCenter`
+    /// scope; this does not read a `TaskCenter` task-local itself. It is threaded through to the
+    /// GCP credential client, which needs a runtime with process lifetime for credential refresh
+    /// tasks it spawns -- and is itself called from invoker invocation tasks, which run on a plain
+    /// `tokio::JoinSet` with no `TaskCenter` task-local of their own.
     pub fn from_options(
         options: &ServiceClientOptions,
         assume_role_cache_mode: AssumeRoleCacheMode,
+        task_center: Handle,
     ) -> Result<Self, BuildError> {
         let request_identity_key = if let Some(request_identity_private_key_pem_file) =
             options.request_identity_private_key_pem_file.clone()
@@ -103,7 +110,7 @@ impl ServiceClient {
         Ok(Self::new(
             HttpClient::from_options(&options.http),
             LambdaClient::from_options(&options.lambda, assume_role_cache_mode),
-            GcpTokenClient::new(),
+            GcpTokenClient::new(task_center),
             request_identity_key,
             options
                 .additional_request_headers

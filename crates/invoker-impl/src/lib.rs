@@ -37,6 +37,7 @@ use tokio_util::time::delay_queue::Key as RetryTimerKey;
 use tracing::instrument;
 use tracing::{debug, trace, warn};
 
+use restate_core::Handle;
 use restate_core::cancellation_token;
 use restate_errors::warn_it;
 use restate_memory::{ByteCount, LocalMemoryPool, MemoryLease, MemoryPool, OutOfMemoryKind};
@@ -310,6 +311,11 @@ impl<StorageReader, TEntryEnricher, Schemas> Service<StorageReader, TEntryEnrich
         }
     }
 
+    /// `task_center` must be captured by the caller while running inside `TaskCenter` scope; it is
+    /// threaded through to the GCP credential client, which needs a runtime with process lifetime
+    /// for the credential refresh tasks it spawns. This matters because invocation tasks run on a
+    /// plain `tokio::JoinSet` (see `Service::run`/`invocation_task_runner`), not on `TaskCenter`,
+    /// so `GcpTokenClient::mint()` called from them has no `TaskCenter` task-local to read.
     #[allow(clippy::too_many_arguments)]
     pub fn from_options(
         invoker_id: impl Into<InvokerId>,
@@ -323,6 +329,7 @@ impl<StorageReader, TEntryEnricher, Schemas> Service<StorageReader, TEntryEnrich
         invocation_token_bucket: Option<TokenBucket>,
         action_token_bucket: Option<TokenBucket>,
         memory_pool: MemoryPool,
+        task_center: Handle,
     ) -> Result<Service<StorageReader, TEntryEnricher, Schemas>, BuildError>
     where
         StorageReader: InvocationReader + Clone + Send + Sync + 'static,
@@ -330,8 +337,11 @@ impl<StorageReader, TEntryEnricher, Schemas> Service<StorageReader, TEntryEnrich
         Schemas: DeploymentResolver + InvocationTargetResolver + Clone,
     {
         metric_definitions::describe_metrics();
-        let client =
-            ServiceClient::from_options(service_client_options, AssumeRoleCacheMode::Unbounded)?;
+        let client = ServiceClient::from_options(
+            service_client_options,
+            AssumeRoleCacheMode::Unbounded,
+            task_center,
+        )?;
 
         Ok(Service::new(
             invoker_id,
@@ -2283,6 +2293,7 @@ mod tests {
             ServiceClient::from_options(
                 &ServiceClientOptions::default(),
                 AssumeRoleCacheMode::None,
+                TaskCenter::current(),
             )
             .unwrap(),
             test_util::MockEntryEnricher,

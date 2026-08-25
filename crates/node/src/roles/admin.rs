@@ -104,6 +104,7 @@ impl<T: TransportConnect> AdminRole<T> {
         let service_client = ServiceClient::from_options(
             &config.worker.invoker.service_client,
             AssumeRoleCacheMode::None,
+            TaskCenter::current(),
         )?;
         let serdes_client = SerdesClient::new(service_client.clone());
         let service_discovery = ServiceDiscovery::new(retry_policy, service_client);

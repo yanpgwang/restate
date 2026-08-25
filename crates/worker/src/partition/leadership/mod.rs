@@ -670,6 +670,7 @@ where
                 node_ctx.invoker_capacity.invocation_token_bucket.clone(),
                 node_ctx.invoker_capacity.action_token_bucket.clone(),
                 node_ctx.invoker_capacity.memory_pool.clone(),
+                TaskCenter::current(),
             )?;
 
             let mut invoker_handle = invoker.handle();

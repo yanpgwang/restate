@@ -125,9 +125,17 @@ async fn upstream_recorder() -> (SocketAddr, RecordedHeaders) {
 }
 
 fn build_service_client() -> ServiceClient {
+    // No production code path in this test ever resolves the credential registry (all cases seed
+    // or force-fail the client's own test overlay), so a disposable, never-started TaskCenter
+    // handle is enough here.
+    let task_center = restate_core::TaskCenterBuilder::default_for_tests()
+        .build()
+        .expect("task center builds")
+        .into_handle();
     ServiceClient::from_options(
         &ServiceClientOptions::default(),
         restate_service_client::AssumeRoleCacheMode::Unbounded,
+        task_center,
     )
     .expect("ServiceClient construction")
 }
