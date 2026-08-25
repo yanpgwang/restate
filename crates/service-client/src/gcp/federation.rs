@@ -68,6 +68,9 @@ const BROKER_REFRESH_MARGIN: Duration = Duration::from_secs(300);
 /// construction then fails with a permanent, actionable [`GcpAuthError::Build`] rather than
 /// falling back to an unauthenticated request.
 ///
+/// Operator-owned; see [`GcpFederationOptions`] for the security rationale for why this
+/// configuration can only ever come from the operator, never from a deployment registration.
+///
 /// Stays a plain process-wide static rather than moving onto `CredentialRegistry` alongside
 /// `federated_sources`: this is install-once operator configuration for the whole process, not
 /// state tied to any one task center's runtime, so a task center replacement (see

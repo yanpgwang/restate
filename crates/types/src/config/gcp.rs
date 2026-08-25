@@ -29,6 +29,25 @@ use serde::{Deserialize, Serialize};
 /// stays active until the process restarts. A changed value is logged but otherwise ignored,
 /// since a broker built from the original config may already be in use by in-flight federated
 /// mints.
+///
+/// **The broker identity belongs to this operator config, and must never become settable through
+/// deployment registration.** A federated deployment's own fields -- `workload_identity_provider`,
+/// `impersonate_service_account`, `audience` -- are claims about the *customer's* side of the
+/// trust chain, verified by the customer's own IAM: a wrong value simply fails at their boundary.
+/// The broker (`broker_role_arn` + `session_name`) is a claim about the *operator's* side,
+/// verified by the operator's trust policy, and so belongs to the operator's config, never the
+/// registrant's. Two reasons this is load-bearing, not just tidy:
+///
+/// 1. **Confused deputy.** Deployment configuration is registrant-controlled data, while the
+///    server's own ambient AWS identity typically holds broad `sts:AssumeRole` permissions (the
+///    Lambda assume-role feature depends on exactly that). If a registrant could choose the role
+///    ARN the server assumes for federation, they could direct the server to assume *any* role
+///    that trusts the server's identity and present that assumed identity to GCP -- the server
+///    acting as a confused deputy on the registrant's behalf.
+/// 2. **Defense in depth.** The broker role's trust policy is expected to pin the session name.
+///    Keeping the session name out of registrant reach means the runtime never even emits an
+///    identity the operator didn't configure, rather than relying solely on one hand-written IAM
+///    condition to catch a registrant-supplied value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]

@@ -39,6 +39,11 @@ pub enum HttpAuth {
 /// Persisted Google OIDC ID-token authentication. `audience` is always present in the persisted
 /// shape: callers building this value must supply a concrete audience, derived from the deployment
 /// URI when the operator did not provide one explicitly.
+///
+/// Deliberately has no field for the AWS-side broker identity (the role Restate assumes to sign
+/// the federation subject token) -- see
+/// [`GcpFederationOptions`](crate::config::GcpFederationOptions) for why that identity is
+/// operator config, never something a registrant-controlled record like this one can carry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct GoogleIdTokenAuth {
     /// Service account email to impersonate via `iamcredentials:generateIdToken`. None means use
