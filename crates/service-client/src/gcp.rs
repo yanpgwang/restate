@@ -2231,7 +2231,11 @@ mod tests {
             audience: audience.to_owned(),
         };
         assert!(
-            credential_registry_for_test().cache.get(&key).await.is_none(),
+            credential_registry_for_test()
+                .cache
+                .get(&key)
+                .await
+                .is_none(),
             "a construction failure must never populate the cache"
         );
 
@@ -2347,7 +2351,10 @@ mod tests {
             install_override();
             // The outer credential build is real (not overridden), so it may fail; only the
             // source-sharing build count below is under test.
-            let _ = credential_registry(&tc_a).expect("tc_a is not shutting down").get_or_build(&spec).await;
+            let _ = credential_registry(&tc_a)
+                .expect("tc_a is not shutting down")
+                .get_or_build(&spec)
+                .await;
         }
         .in_tc(&tc_a)
         .await;
@@ -2360,7 +2367,10 @@ mod tests {
             .into_handle();
         async {
             install_override();
-            let _ = credential_registry(&tc_b).expect("tc_b is not shutting down").get_or_build(&spec).await;
+            let _ = credential_registry(&tc_b)
+                .expect("tc_b is not shutting down")
+                .get_or_build(&spec)
+                .await;
         }
         .in_tc(&tc_b)
         .await;
