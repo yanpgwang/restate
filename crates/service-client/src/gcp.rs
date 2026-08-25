@@ -14,8 +14,8 @@
 //! Building a `google-cloud-auth` credential starts a background refresh task that lives as long as
 //! the credential does. The entire credential is cached in a process-global registry keyed by
 //! `(audience, impersonate_service_account)`; impersonated keys additionally share a process-wide
-//! ambient source credential (see [`CredentialRegistry::ambient_source`]). Construction must run as a
-//! [`TaskKind::Credentials`] task on TaskCenter's default runtime, so a credential's refresh task
+//! ambient source credential (see [`CredentialRegistry::ambient_source`]). Construction runs as a
+//! [`TaskKind::Credentials`] task on TaskCenter's default runtime, so each credential's refresh task
 //! lands on a runtime with process lifetime rather than the runtime that happens to call `mint()`.
 //!
 //! [`GcpTokenClient`] captures its [`Handle`] explicitly at construction and threads it through to
@@ -58,7 +58,8 @@ const CACHE_HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(300);
 const AMBIENT_SOURCE_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Caps concurrent blocking `google-cloud-auth`/ADC builds, so a burst of distinct new keys (or a
-/// GCP outage causing every retry to rebuild) cannot exhaust tokio's blocking thread pool.
+/// GCP outage causing every retry to rebuild) cannot exhaust tokio's blocking thread pool. This is
+/// fixed rather than CPU-scaled because Tokio's blocking pool is independent of CPU concurrency.
 const MAX_CONCURRENT_BLOCKING_BUILDS: usize = 4;
 
 #[derive(Clone, Debug, Error)]
@@ -539,11 +540,9 @@ async fn ambient_source_is_dead(source: &google_cloud_auth::credentials::Credent
 
 /// Bounds concurrent blocking `google-cloud-auth`/ADC builds. Acquired strictly around the
 /// `spawn_blocking` call in [`spawn_bounded_blocking`] -- not around a whole key's construction --
-/// so a permit is never held while waiting on another: [`CredentialRegistry::build_credentials`]
-/// fully resolves the ambient source (which acquires and releases its own permit here) *before*
-/// its own call into this bound. A previous, broader semaphore wrapped the whole construction
-/// path and deadlocked this way when an impersonated build, already holding the one permit it
-/// took, waited on the ambient source's build for a second permit from the same exhausted pool.
+/// so a permit is never held while waiting on another. In particular,
+/// [`CredentialRegistry::build_credentials`] resolves the ambient source before entering this
+/// bound for the outer credential build.
 static BLOCKING_BUILD_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BLOCKING_BUILDS);
 
 async fn spawn_bounded_blocking<T: Send + 'static>(
@@ -609,10 +608,9 @@ fn build_impersonated_credentials(
     Ok(Arc::new(Live(credentials)) as Arc<dyn IdTokenSource>)
 }
 
-/// Token-mint client: a cheap handle to the process-global credential [`Registry`]. Every
-/// `ServiceClient` clone shares the same registry, so distinct GCP identities each own at most one
-/// credential (and its refresh task) for the life of the process. Outside tests the only state it
-/// carries of its own is the `Handle` it was constructed with, which it passes explicitly to
+/// Token-mint client: a cheap handle to the process-global credential registry. `ServiceClient`
+/// clones share cached credentials and their refresh tasks. Outside tests the only state this
+/// handle carries is the `Handle` it was constructed with, which it passes explicitly to
 /// [`credential_registry`] on every mint -- `mint()` is reachable from invoker invocation tasks,
 /// which have no `TaskCenter` task-local of their own, so this client never relies on one.
 #[derive(Clone)]
@@ -632,8 +630,8 @@ struct Inner {
 }
 
 impl GcpTokenClient {
-    /// `task_center` must be captured by the caller while running inside `TaskCenter` scope (e.g.
-    /// at `ServiceClient` construction); this client never reads a `TaskCenter` task-local itself.
+    /// The caller captures `task_center` at construction; minting never reads a TaskCenter
+    /// task-local from the calling task.
     pub fn new(task_center: Handle) -> Self {
         Self {
             task_center,
@@ -1473,20 +1471,12 @@ mod tests {
         );
     }
 
-    /// The decisive regression test: invoker invocation tasks run on a plain `tokio::JoinSet`, not
-    /// on `TaskCenter`, so a `GcpTokenClient::mint()` called from one has no `TaskCenter`
-    /// task-local -- calling `TaskCenter::current()` there panics with "called outside
-    /// task-center task", killing the partition processor. Builds the client under TaskCenter A,
-    /// then mints from inside a bare `tokio::spawn` task on a *different*, disposable runtime
-    /// (reproducing the invoker's `JoinSet` exactly: no `TaskCenter::spawn*` call anywhere on that
-    /// path, so it carries no `TaskCenter` task-local), and confirms credential construction still
-    /// landed on A's own default runtime -- reusing the probe technique from
-    /// `credential_construction_runs_on_task_centers_default_runtime_not_the_callers` above.
+    /// Invoker tasks run on a plain `tokio::JoinSet` without a TaskCenter task-local. Build the
+    /// client under TaskCenter A, mint from a bare task on another runtime, and verify credential
+    /// construction still runs on A's default runtime.
     ///
-    /// A plain `#[test]` driving two hand-built runtimes with `block_on`, like that test, rather
-    /// than `#[tokio::test]`: dropping a runtime from within another runtime's async context
-    /// panics, and this test's disposable "invocation" runtime must be dropped before the probe
-    /// assertion below to prove the probe survives it.
+    /// This uses hand-built runtimes because Tokio forbids dropping a runtime from another
+    /// runtime's async context.
     #[test]
     fn mint_succeeds_from_a_task_with_no_task_center_task_local() {
         use restate_core::TaskCenterBuilder;
@@ -1554,12 +1544,8 @@ mod tests {
         );
     }
 
-    /// Complements `registry_rebuilds_after_the_task_center_that_built_it_is_replaced` from the
-    /// client's own perspective: a `GcpTokenClient` retained across an embedded-server restart
-    /// still holds a `Handle` to the old, now-shutting-down TaskCenter A. Its `mint()` must fail
-    /// cleanly -- never panic -- and, critically, must not resurrect TC A's dead registry into the
-    /// global slot and thereby displace whatever TC B (the new generation) has already installed
-    /// there.
+    /// A client retained across an embedded-server restart must fail cleanly without reinstalling
+    /// its stopped TaskCenter's registry over the new generation.
     #[tokio::test(flavor = "multi_thread")]
     async fn stale_client_bound_to_a_shutdown_task_center_cannot_displace_the_new_generation() {
         use restate_core::{TaskCenterBuilder, TaskCenterFutureExt as _};
