@@ -85,7 +85,7 @@ pub struct Register {
     /// When set, Restate mints the ID token via the AWS -> GCP workload identity federation
     /// chain (an AWS role assumption signed and exchanged at this provider) instead of its
     /// ambient Application Default Credentials. Requires the Restate server to be configured
-    /// with a `[gcp-federation]` broker role, and requires
+    /// with a `[gcp-federation]` AWS role, and requires
     /// --gcp-impersonate-service-account: the resulting external-account credential cannot mint
     /// an ID token ambiently. Implies --gcp-id-token.
     #[clap(long)]

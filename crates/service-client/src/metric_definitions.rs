@@ -16,20 +16,12 @@ pub(crate) const GCP_CREDENTIAL_BUILD_DURATION: &str =
 pub(crate) const GCP_TOKEN_MINTS: &str = "restate.service_client.gcp.token_mints.total";
 pub(crate) const GCP_CREDENTIALS_ACTIVE: &str = "restate.service_client.gcp.credentials.active";
 
-/// Incremented at `AwsSubjectTokenProvider::subject_token()`'s single exit. `google-cloud-auth`'s
-/// external-account refresh loop calls this on every federated credential refresh, so it is the
-/// only crate-external heartbeat of federated refresh activity available without upstream
-/// support: its success rate approximates federated refresh health, and its errors surface
-/// failures in the AWS hop (broker credential fetch and SigV4 signing) specifically, ahead of the
-/// STS exchange and impersonation steps that follow.
+/// Counts AWS subject-token creation attempts. Errors isolate AWS credential and SigV4-signing
+/// failures from later Google STS and impersonation failures.
 pub(crate) const GCP_FEDERATION_SUBJECT_TOKENS: &str =
     "restate.service_client.gcp.federation.subject_tokens.total";
-/// The per-provider twin of [`GCP_CREDENTIALS_ACTIVE`]: the population of shared federated
-/// access-token sources, one per WIF provider resource in `federated_access_token_sources`. Set
-/// only on the registry's housekeeping tick -- unlike `GCP_CREDENTIALS_ACTIVE`, there is no
-/// separate after-each-build update site any more, since a source's weak-indexed, leased entry
-/// only meaningfully changes when housekeeping's reap pass observes it. Approximate: this can lag
-/// both new sources and removals by up to one housekeeping interval.
+/// Number of live per-provider federated access-token sources. Housekeeping updates this gauge,
+/// so it can lag additions and removals by one interval.
 pub(crate) const GCP_FEDERATION_SOURCES_ACTIVE: &str =
     "restate.service_client.gcp.federation.sources.active";
 
@@ -42,11 +34,7 @@ pub(crate) const MINT_OUTCOME_TRANSIENT_ERROR: &str = "transient_error";
 pub(crate) const MINT_OUTCOME_PERMANENT_ERROR: &str = "permanent_error";
 pub(crate) const MINT_OUTCOME_BUILD_ERROR: &str = "build_error";
 
-/// `token_mints.total`'s `mode` label: separates federated mint failures (the customer-facing
-/// misconfiguration surface for Cloud -- a wrong WIF provider or missing impersonation binding)
-/// from ordinary ADC-path failures, without log-diving. Deliberately not added to the build
-/// counters: a build failure is already distinguishable from its log record, and duplicating the
-/// dimension there buys nothing.
+/// Bounded `token_mints.total` label distinguishing ADC and federated mint paths.
 pub(crate) const MINT_MODE_ADC: &str = "adc";
 pub(crate) const MINT_MODE_FEDERATED: &str = "federated";
 

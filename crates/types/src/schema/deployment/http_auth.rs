@@ -40,8 +40,8 @@ pub enum HttpAuth {
 /// shape: callers building this value must supply a concrete audience, derived from the deployment
 /// URI when the operator did not provide one explicitly.
 ///
-/// Deliberately has no field for the AWS-side broker identity (the role Restate assumes to sign
-/// the federation subject token) -- see
+/// Deliberately has no field for the AWS federation identity Restate uses to sign subject tokens;
+/// that identity is operator-controlled process configuration. See
 /// [`GcpFederationOptions`](crate::config::GcpFederationOptions) for why that identity is
 /// operator config, never something a registrant-controlled record like this one can carry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -54,7 +54,7 @@ pub struct GoogleIdTokenAuth {
     audience: ByteString,
     /// Full resource name of a GCP workload identity federation provider, e.g.
     /// `//iam.googleapis.com/projects/N/locations/global/workloadIdentityPools/P/providers/R`.
-    /// When set, the ID token is minted via the AWS -> GCP federation chain (broker role
+    /// When set, the ID token is minted via the AWS -> GCP federation chain (AWS role
     /// assumption, SigV4 subject token, Google STS exchange, then impersonation) instead of the
     /// server's ambient Application Default Credentials. Requires `impersonate_service_account`:
     /// the external-account credential this chain produces cannot mint an ID token ambiently.
@@ -62,8 +62,6 @@ pub struct GoogleIdTokenAuth {
     workload_identity_provider: Option<ByteString>,
 }
 
-/// Invariant violation constructing a [`GoogleIdTokenAuth`]. Checked once, in [`GoogleIdTokenAuth::new`],
-/// so every persisted record satisfies it by construction.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GoogleIdTokenAuthError {
     #[error(
@@ -92,10 +90,6 @@ impl GoogleIdTokenAuthError {
 }
 
 impl GoogleIdTokenAuth {
-    /// Builds a persisted `GoogleIdTokenAuth`, rejecting a `workload_identity_provider` that lacks
-    /// `impersonate_service_account` or is not a canonical GCP resource name -- the only two ways
-    /// this record can be invalid, so checking them here means every `GoogleIdTokenAuth` in
-    /// existence already satisfies them.
     pub fn new(
         audience: ByteString,
         impersonate_service_account: Option<ByteString>,
@@ -134,17 +128,9 @@ impl GoogleIdTokenAuth {
 
 /// Validates that `resource` has the shape
 /// `//iam.googleapis.com/projects/<project-number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>`,
-/// matching Google's actual workload identity pool/provider creation contract as of this writing
-/// (`projects.locations.workloadIdentityPools[.providers].create`): the location must be `global`
-/// (the only location Google currently supports for workload identity pools -- there is no
-/// regional variant yet); pool and provider ids must be 4-32 characters of lowercase letters,
-/// digits, and hyphens; and the `gcp-` id prefix is reserved for Google's own use. Enforced
-/// strictly rather than loosely: a too-strict rejection if Google later adds regional pools or
-/// loosens the id charset is a one-line release-time fix, whereas accepting a name Google itself
-/// would reject lets an un-mintable typo persist into a deployment record that only fails later,
-/// with an opaque Google STS error, at the first mint attempt. Persisted verbatim into cache keys,
-/// SigV4 `SignedHeaders`, and the Google STS `audience` parameter, so an arbitrary string here is
-/// a functional bug waiting to happen, not just a cosmetic one.
+/// matching Google's workload identity pool/provider creation constraints: global location;
+/// 4-32 lowercase alphanumeric-or-hyphen IDs; and no reserved `gcp-` prefix. Strict validation
+/// prevents an unusable provider name from becoming part of persisted state and cache keys.
 fn validate_provider_resource_name(resource: &str) -> Result<(), &'static str> {
     let is_valid_id = |s: &str| {
         (4..=32).contains(&s.len())
@@ -279,7 +265,7 @@ mod tests {
         assert!(derive_audience(&parse("/discover")).is_none());
     }
 
-    const PROVIDER: &str = "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws-broker";
+    const PROVIDER: &str = "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws-federation";
 
     #[test]
     fn new_enforces_provider_requires_impersonation() {
@@ -344,38 +330,29 @@ mod tests {
         for provider in [
             "",
             "not-a-resource-name",
-            "iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws-broker",
-            "//iam.googleapis.com/projects/abc/locations/global/workloadIdentityPools/pool/providers/aws-broker",
-            "//iam.googleapis.com/projects//locations/global/workloadIdentityPools/pool/providers/aws-broker",
-            "//iam.googleapis.com/projects/123/locations//workloadIdentityPools/pool/providers/aws-broker",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools//providers/aws-broker",
+            "iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws-federation",
+            "//iam.googleapis.com/projects/abc/locations/global/workloadIdentityPools/pool/providers/aws-federation",
+            "//iam.googleapis.com/projects//locations/global/workloadIdentityPools/pool/providers/aws-federation",
+            "//iam.googleapis.com/projects/123/locations//workloadIdentityPools/pool/providers/aws-federation",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools//providers/aws-federation",
             "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/",
-            "//iam.googleapis.com/projects/123/regions/global/workloadIdentityPools/pool/providers/aws-broker",
-            "//iam.googleapis.com/projects/123/locations/global/pools/pool/providers/aws-broker",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/endpoints/aws-broker",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws-broker/extra",
-            // Rejected only by the tightened per-segment identifier check: no `/` in these, so
-            // the old segment-count-only parser accepted them.
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/has space/providers/aws-broker",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/100%broker",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/caf\u{e9}-broker",
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool?/providers/aws-broker",
-            // F3: Google supports only the `global` location for workload identity pools -- no
-            // regional pools exist yet.
-            "//iam.googleapis.com/projects/1/locations/eu/workloadIdentityPools/pool/providers/aws-broker",
-            // F3: ids shorter than 4 characters are not something Google will create.
+            "//iam.googleapis.com/projects/123/regions/global/workloadIdentityPools/pool/providers/aws-federation",
+            "//iam.googleapis.com/projects/123/locations/global/pools/pool/providers/aws-federation",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/endpoints/aws-federation",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/aws-federation/extra",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/has space/providers/aws-federation",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/100%provider",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/caf\u{e9}-provider",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool?/providers/aws-federation",
+            "//iam.googleapis.com/projects/1/locations/eu/workloadIdentityPools/pool/providers/aws-federation",
             "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/abc",
-            // F3: ids longer than 32 characters are not something Google will create.
             &format!(
                 "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/{}",
                 "a".repeat(33),
             ),
-            // F3: uppercase is outside Google's [a-z0-9-] id charset.
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/Pool/providers/aws-broker",
-            // F3: underscore is outside Google's [a-z0-9-] id charset -- only hyphen is allowed.
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool_x/providers/aws_broker",
-            // F3: the `gcp-` id prefix is reserved for Google's own use.
-            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/gcp-reserved/providers/aws-broker",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/Pool/providers/aws-federation",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool_x/providers/aws_federation",
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/gcp-reserved/providers/aws-federation",
         ] {
             let err = provider_auth(provider)
                 .expect_err(&format!("expected '{provider}' to be rejected"));

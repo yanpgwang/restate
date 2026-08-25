@@ -25,8 +25,8 @@
 //!
 //! A deployment may additionally request AWS -> GCP workload identity federation (see
 //! [`federation`]): rather than ambient Application Default Credentials, the ID token is minted
-//! through a shared AWS broker role, a SigV4-signed subject token, a Google STS exchange, and
-//! impersonation. That path is a fourth [`IdTokenSource`] construction recipe, keyed by
+//! through an operator-configured AWS federation role, a SigV4-signed subject token, a Google STS
+//! exchange, and impersonation. That path is a fourth [`IdTokenSource`] construction recipe, keyed by
 //! `wif_provider` and cached and refreshed exactly like the others; unlike them, its construction
 //! is pure async I/O (no blocking ADC reads), so it dispatches from the same
 //! [`CredentialRegistry::build_on_tc_task`] task without going through the blocking-build path.
@@ -317,14 +317,9 @@ impl Drop for ClearRegistrySlotOnDrop {
 /// would otherwise recreate the old generation's registry and displace whatever the new
 /// generation has already installed. That case returns a build-error message instead.
 ///
-/// [`FEDERATION_CONFIG`](federation) and federation's `BROKER` stay plain process-wide statics
-/// rather than moving here: `FEDERATION_CONFIG` is install-once operator configuration for the
-/// process, not state tied to any one task center's runtime, and `BROKER` holds AWS credential
-/// state (an `AssumeRoleProvider` plus a cached session) with no background refresh task of its
-/// own -- neither has anything spawned onto a task center that could go stale when this registry
-/// rebuilds. `federated_access_token_sources` is different: each source's refresh task is spawned
-/// on whichever task center built it, so it must rebuild -- not persist -- across a replacement
-/// too.
+/// Federation configuration and assumed-role credentials stay process-wide: neither owns work
+/// spawned on a TaskCenter runtime. Federated access-token sources do own refresh tasks, so they
+/// must be rebuilt when their registry's TaskCenter is replaced.
 fn credential_registry(task_center: &Handle) -> Result<Arc<CredentialRegistry>, String> {
     if let Some(slot) = REGISTRY.read().as_ref()
         && slot.task_center.ptr_eq(task_center)
@@ -544,7 +539,7 @@ impl CredentialRegistry {
                 }
                 let start = Instant::now();
                 let result = if spec.wif_provider.is_some() {
-                    // Pure async I/O (assume the AWS broker role, sign and exchange the SigV4
+                    // Pure async I/O (assume the AWS federation role, sign and exchange the SigV4
                     // subject token) -- deliberately not routed through spawn_bounded_blocking, so
                     // it is not bounded by BLOCKING_BUILD_PERMITS. Its concurrency is instead
                     // bounded by per-key single-flight (this same cache) and by the number of
@@ -1136,8 +1131,8 @@ mod tests {
         assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 
-    /// Pins P1's fix (restatedev/restate#5151): the impersonated arm's source ADC credential is a
-    /// single process-wide refresh task, not one per key. Proving `ambient_source` single-flights
+    /// The impersonated arm's source ADC credential is a single process-wide refresh task, not
+    /// one per key. Proving `ambient_source` single-flights
     /// and shares its result is equivalent to proving N concurrent impersonated constructions
     /// share one source build.
     ///

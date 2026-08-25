@@ -690,7 +690,7 @@ pub struct ServiceClientOptions {
     /// # GCP workload identity federation
     ///
     /// Enables minting Google ID tokens for deployments that set `workload_identity_provider` in
-    /// their `auth` block, via a shared AWS -> GCP workload identity federation broker. Unset by
+    /// their `auth` block, using an operator-configured AWS federation role. Unset by
     /// default: deployments requesting this authentication fail registration and mint with an
     /// actionable error until this block is configured.
     ///

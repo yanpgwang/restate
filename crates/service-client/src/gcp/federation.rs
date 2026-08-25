@@ -8,24 +8,21 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! AWS -> GCP workload identity federation, for minting a Google ID token from AWS-hosted
-//! Restate without any Google identity of its own.
+//! AWS-to-GCP workload identity federation for minting Google ID tokens without storing Google
+//! credentials in Restate.
 //!
-//! The trust chain (restate-cloud#1188):
+//! The trust chain is:
 //!
 //! ```text
-//! EKS Pod Identity
-//!   -> sts:AssumeRole(shared broker role, RoleSessionName set by the operator)
+//! ambient AWS credentials
+//!   -> sts:AssumeRole(operator-configured AWS federation role)
 //!   -> SigV4-signed GetCallerIdentity envelope (AIP-4117 aws4_request)
-//!   -> Google STS token exchange at the customer's workload identity provider
-//!   -> IAM Credentials generateIdToken, impersonating the customer's invocation service account
+//!   -> Google STS token exchange at the deployment's workload identity provider
+//!   -> IAM Credentials generateIdToken as the deployment's service account
 //! ```
 //!
-//! The broker role assumption (the first hop) is shared by every federated deployment in the
-//! process: it is operator configuration ([`GcpFederationOptions`]), not tenant-controlled, and
-//! multiplying it per deployment would multiply `sts:AssumeRole` traffic for no isolation gain.
-//! Everything from the SigV4 envelope onward is built fresh per deployment, scoped by that
-//! deployment's own `workload_identity_provider` and `impersonate_service_account`.
+//! The assumed AWS role session is shared across the process. Everything after it is scoped by a
+//! deployment's `workload_identity_provider` and `impersonate_service_account`.
 
 use std::fmt;
 use std::sync::{Arc, Weak};
@@ -58,9 +55,9 @@ use super::{GcpAuthError, IdTokenSource, IdTokenSpec, RecoverableCell};
 const AWS4_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:aws:token-type:aws4_request";
 const GOOGLE_STS_TOKEN_URL: &str = "https://sts.googleapis.com/v1/token";
 
-/// Refresh the cached broker session this far ahead of its literal expiry, so a deployment
-/// refreshing its own credential never blocks on a concurrent broker refresh.
-const BROKER_REFRESH_MARGIN: Duration = Duration::from_secs(300);
+/// Refresh the assumed AWS role session before it expires so subject-token generation does not
+/// race its expiry.
+const AWS_ROLE_REFRESH_MARGIN: Duration = Duration::from_secs(300);
 
 /// The process-wide `[gcp-federation]` config, installed once from `ServiceClient` construction
 /// (see [`install_config`]). Unset means the operator never configured the block: every federated
@@ -70,44 +67,23 @@ const BROKER_REFRESH_MARGIN: Duration = Duration::from_secs(300);
 /// Operator-owned; see [`GcpFederationOptions`] for the security rationale for why this
 /// configuration can only ever come from the operator, never from a deployment registration.
 ///
-/// Stays a plain process-wide static rather than moving onto `CredentialRegistry` alongside
-/// `federated_access_token_sources`: this is install-once operator configuration for the whole
-/// process, not state tied to any one task center's runtime, so a task center replacement (see
-/// `credential_registry`'s doc in `gcp/mod.rs`) has nothing here that could go stale.
-///
-/// **Not live-reloadable.** Restate live-reloads its config file, but a `Broker` built from this
-/// value may already be in use by in-flight federated mints, so a changed block after the first
-/// install is only ever logged, never applied -- changing `broker-role-arn` or `session-name`
-/// requires a process restart.
+/// This stays process-wide because it is operator configuration, not state owned by a TaskCenter.
+/// It is not live-reloadable: already-constructed credentials retain the AWS federation identity
+/// used at construction, so changes are logged and ignored until restart.
 static FEDERATION_CONFIG: std::sync::OnceLock<GcpFederationOptions> = std::sync::OnceLock::new();
 
-/// Outcome of comparing an incoming `[gcp-federation]` config against whatever this process
-/// already has installed, independent of the [`FEDERATION_CONFIG`] cell itself so it can be unit
-/// tested without process-global state.
+/// Result of comparing incoming configuration with the process-wide value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigInstallOutcome {
-    /// No config was supplied and none is installed; there is nothing to do.
     NotRequested,
-    /// Nothing is installed yet; `incoming` becomes the process-wide value.
     FirstInstall,
-    /// Identical to what's already installed.
     Unchanged,
-    /// Differs from what's already installed. `[gcp-federation]` is not live-reloadable, so the
-    /// already-installed value stays active.
     Differing,
-    /// A config was installed, but a later reload omitted the `[gcp-federation]` block entirely.
-    /// Removing the block on reload is a live-reload change like any other, and just as
-    /// unapplied: the installed value stays active until a restart.
     RemovalIgnored,
 }
 
-/// Pure decision, independent of both [`FEDERATION_CONFIG`] and validation: whether `incoming`
-/// should install, and if not, why. Validating before deciding the outcome would run
-/// [`validate_broker_role_arn`]/[`validate_session_name`] against a `Differing` or
-/// `RemovalIgnored` value that is going to be discarded regardless of its own shape -- an invalid
-/// differing reload would then return `Err` and fail the caller (leader/service-client
-/// construction) a second time, the exact failure mode the warn-and-keep semantics below exist to
-/// avoid. So [`install_config`] calls this first, and only validates the `FirstInstall` case.
+/// Decide whether to install before validating. Reloaded values are ignored, so rejecting an
+/// invalid replacement would fail service-client construction without changing the active value.
 fn decide_config_install(
     installed: Option<&GcpFederationOptions>,
     incoming: Option<&GcpFederationOptions>,
@@ -123,51 +99,36 @@ fn decide_config_install(
     }
 }
 
-/// Names the `[gcp-federation]` fields that differ between `installed` and `incoming`, for the
-/// differing-reinstall warning below. Without this, a reload that changed only `session-name`
-/// logged as "broker-role-arn changed from X to X" -- accurate about nothing having changed on
-/// the field it named, and silent about the field that actually did.
+/// Describe only the fields that differ for the reload warning.
 fn describe_config_diff(
     installed: &GcpFederationOptions,
     incoming: &GcpFederationOptions,
 ) -> String {
     let mut changes = Vec::new();
-    if installed.broker_role_arn != incoming.broker_role_arn {
+    if installed.aws_role_arn != incoming.aws_role_arn {
         changes.push(format!(
-            "broker-role-arn '{}' -> '{}'",
-            installed.broker_role_arn, incoming.broker_role_arn
+            "aws-role-arn '{}' -> '{}'",
+            installed.aws_role_arn, incoming.aws_role_arn
         ));
     }
-    if installed.session_name != incoming.session_name {
+    if installed.aws_role_session_name != incoming.aws_role_session_name {
         changes.push(format!(
-            "session-name '{}' -> '{}'",
-            installed.session_name, incoming.session_name
+            "aws-role-session-name '{}' -> '{}'",
+            installed.aws_role_session_name, incoming.aws_role_session_name
         ));
     }
     changes.join(", ")
 }
 
-/// Install the process-wide `[gcp-federation]` config. Every `ServiceClient` built from the same
-/// `ServiceClientOptions` calls this, including on every config live-reload (see
-/// [`FEDERATION_CONFIG`]'s doc for why a changed block after the first install cannot actually be
-/// applied): `None` is always a no-op; the first `Some` installs; an identical `Some` re-install is
-/// a no-op; a *differing* `Some` re-install, or a reload that removes the block, is logged and
-/// otherwise ignored, keeping the original value active.
-///
-/// Validates `config` only for a `FirstInstall`, so an operator learns about a typo in
-/// `broker-role-arn` or `session-name` at server startup rather than on the first federated
-/// invocation -- config errors here are always permanent, unlike the runtime failures
-/// `GcpAuthError` classifies as transient/permanent. A `Differing` or `RemovalIgnored` reload is
-/// never validated, since it's discarded regardless of its own shape: validating it anyway would
-/// let an invalid differing reload return `Err` and fail the caller a second time, defeating the
-/// warn-and-keep semantics this function exists to provide (see [`decide_config_install`]).
+/// Install and validate the process-wide configuration. Later changes are logged and ignored
+/// until restart; validating ignored replacements would unnecessarily fail the caller.
 pub(crate) fn install_config(config: Option<GcpFederationOptions>) -> Result<(), String> {
     match decide_config_install(FEDERATION_CONFIG.get(), config.as_ref()) {
         ConfigInstallOutcome::NotRequested | ConfigInstallOutcome::Unchanged => {}
         ConfigInstallOutcome::FirstInstall => {
             let config = config.expect("FirstInstall implies a config was given");
-            validate_broker_role_arn(&config.broker_role_arn)?;
-            validate_session_name(&config.session_name)?;
+            validate_aws_role_arn(&config.aws_role_arn)?;
+            validate_aws_role_session_name(&config.aws_role_session_name)?;
             let _ = FEDERATION_CONFIG.set(config);
         }
         ConfigInstallOutcome::Differing => {
@@ -177,10 +138,10 @@ pub(crate) fn install_config(config: Option<GcpFederationOptions>) -> Result<(),
             let incoming = config.expect("Differing implies a config was given");
             tracing::warn!(
                 "[gcp-federation] configuration changed ({}) but this block is not \
-                 live-reloadable; the configuration active since process start (broker-role-arn \
+                 live-reloadable; the configuration active since process start (aws-role-arn \
                  '{}') remains in use until the server is restarted",
                 describe_config_diff(installed, &incoming),
-                installed.broker_role_arn,
+                installed.aws_role_arn,
             );
         }
         ConfigInstallOutcome::RemovalIgnored => {
@@ -189,22 +150,22 @@ pub(crate) fn install_config(config: Option<GcpFederationOptions>) -> Result<(),
                 .expect("RemovalIgnored implies a config is already installed");
             tracing::warn!(
                 "[gcp-federation] configuration block was removed, but this block is not \
-                 live-reloadable; the configuration active since process start (broker-role-arn \
+                 live-reloadable; the configuration active since process start (aws-role-arn \
                  '{}') remains in use until the server is restarted",
-                installed.broker_role_arn,
+                installed.aws_role_arn,
             );
         }
     }
     Ok(())
 }
 
-/// Validates `arn` against the shape of an AWS IAM role ARN Restate can assume:
-/// `arn:aws[-\w]*:iam::<12-digit account id>:role/<name-or-path>`. Rejects anything else with an
-/// actionable message rather than deferring the typo to the first `sts:AssumeRole` failure.
-fn validate_broker_role_arn(arn: &str) -> Result<(), String> {
+/// Validate the expected IAM role ARN shape so configuration errors fail at startup rather than
+/// at the first `AssumeRole` request. The AWS SDK does not expose a public ARN parser.
+fn validate_aws_role_arn(arn: &str) -> Result<(), String> {
     let invalid = || {
         format!(
-            "broker-role-arn '{arn}' is not a valid AWS IAM role ARN; expected the form              arn:aws:iam::<12-digit account id>:role/<role-name-or-path>"
+            "aws-role-arn '{arn}' is not a valid AWS IAM role ARN; expected \
+             arn:aws:iam::<12-digit account id>:role/<role-name-or-path>"
         )
     };
     let parts: Vec<&str> = arn.split(':').collect();
@@ -230,43 +191,43 @@ fn validate_broker_role_arn(arn: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validates `name` against AWS STS's `RoleSessionName` constraints: 2-64 characters from
-/// `[\w+=,.@-]`. AWS itself enforces this at `sts:AssumeRole` time; validating it at config-install
-/// time surfaces a typo at server startup instead of on the first federated mint attempt.
-fn validate_session_name(name: &str) -> Result<(), String> {
+/// Validate AWS STS `RoleSessionName` constraints at startup. The generated SDK builder leaves
+/// these service-side constraints unchecked.
+fn validate_aws_role_session_name(name: &str) -> Result<(), String> {
     let len = name.chars().count();
     let chars_ok = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c));
     if !(2..=64).contains(&len) || !chars_ok {
         return Err(format!(
-            "session-name '{name}' is not a valid AWS STS RoleSessionName; expected 2-64              characters from [A-Za-z0-9_+=,.@-]"
+            "aws-role-session-name '{name}' is not a valid AWS STS RoleSessionName; expected \
+             2-64 characters from [A-Za-z0-9_+=,.@-]"
         ));
     }
     Ok(())
 }
 
-/// The shared AWS broker identity: one role assumption for the whole process, reused by every
-/// federated [`AwsSubjectTokenProvider`]. Lazily constructed on the first federated construction.
+/// Cached credentials for the process-wide AWS federation role session, reused by every
+/// [`AwsSubjectTokenProvider`] and constructed on first use.
 /// `provider` is type-erased behind `SharedCredentialsProvider` (rather than the concrete
 /// `AssumeRoleProvider`) so tests can wrap a fixed [`AwsCredentials`] value directly instead of
 /// driving the real AWS SDK config/STS machinery.
-struct Broker {
-    /// Resolved once, from the AWS SDK default chain, at broker construction.
+struct AwsFederationCredentials {
+    /// Resolved once from the AWS SDK default chain.
     region: String,
     provider: SharedCredentialsProvider,
     cached: Mutex<Option<AwsCredentials>>,
 }
 
-impl fmt::Debug for Broker {
+impl fmt::Debug for AwsFederationCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Broker")
+        f.debug_struct("AwsFederationCredentials")
             .field("region", &self.region)
             .finish_non_exhaustive()
     }
 }
 
-impl Broker {
+impl AwsFederationCredentials {
     async fn init(config: &GcpFederationOptions) -> Result<Self, String> {
         let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
         let region = sdk_config
@@ -277,9 +238,9 @@ impl Broker {
                  sign the GetCallerIdentity subject token"
                     .to_owned()
             })?;
-        let provider = AssumeRoleProvider::builder(config.broker_role_arn.clone())
+        let provider = AssumeRoleProvider::builder(config.aws_role_arn.clone())
             .configure(&sdk_config)
-            .session_name(config.session_name.clone())
+            .session_name(config.aws_role_session_name.clone())
             .build()
             .await;
         Ok(Self {
@@ -289,8 +250,8 @@ impl Broker {
         })
     }
 
-    /// Returns the current broker session credentials, refreshing them via `sts:AssumeRole` if
-    /// the cached session is absent or within [`BROKER_REFRESH_MARGIN`] of expiry. Shared across
+    /// Returns the current AWS role session credentials, refreshing them via `sts:AssumeRole` if
+    /// the cached session is absent or within [`AWS_ROLE_REFRESH_MARGIN`] of expiry. Shared across
     /// every federated deployment's `subject_token()` calls, so a fleet of federated deployments
     /// refreshing around the same time coalesces into the one `AssumeRole` call each needs rather
     /// than one per deployment.
@@ -299,7 +260,7 @@ impl Broker {
         if let Some(creds) = guard.as_ref() {
             let fresh_enough = creds
                 .expiry()
-                .is_none_or(|expiry| expiry > SystemTime::now() + BROKER_REFRESH_MARGIN);
+                .is_none_or(|expiry| expiry > SystemTime::now() + AWS_ROLE_REFRESH_MARGIN);
             if fresh_enough {
                 return Ok(creds.clone());
             }
@@ -324,7 +285,7 @@ impl Broker {
 fn federation_error_from_assume_role_failure(
     error: &aws_credential_types::provider::error::CredentialsError,
 ) -> FederationError {
-    let message = format!("assuming the GCP workload identity federation broker role: {error}");
+    let message = format!("assuming the AWS federation role for GCP authentication: {error}");
     let access_denied = matches!(
         assume_role_error_code(error),
         Some("AccessDenied" | "AccessDeniedException")
@@ -356,28 +317,28 @@ fn assume_role_error_code<'a>(error: &'a (dyn std::error::Error + 'static)) -> O
     None
 }
 
-static BROKER: OnceCell<Arc<Broker>> = OnceCell::const_new();
+static AWS_FEDERATION_CREDENTIALS: OnceCell<Arc<AwsFederationCredentials>> = OnceCell::const_new();
 
-/// Returns the shared broker, constructing it on first use. Construction failure (missing
+/// Returns the shared AWS federation credentials, constructing them on first use. Construction failure (missing
 /// `[gcp-federation]` config, or no AWS region resolvable) is not cached:
 /// [`OnceCell::get_or_try_init`] leaves the cell empty on `Err`, so the next attempt retries.
 ///
 /// Stays a plain process-wide static for the same reason [`FEDERATION_CONFIG`] does: it holds AWS
 /// credential state (an `AssumeRoleProvider` plus a cached session) with no background refresh
-/// task of its own -- nothing in [`Broker::init`] spawns onto any task center's runtime, so a task
-/// center replacement leaves nothing here to go stale.
-async fn broker() -> Result<Arc<Broker>, String> {
-    BROKER
+/// task of its own. Nothing in [`AwsFederationCredentials::init`] is tied to a TaskCenter runtime,
+/// so TaskCenter replacement cannot leave stale refresh work behind.
+async fn aws_federation_credentials() -> Result<Arc<AwsFederationCredentials>, String> {
+    AWS_FEDERATION_CREDENTIALS
         .get_or_try_init(|| async {
             let Some(config) = FEDERATION_CONFIG.get() else {
                 return Err(
                     "this deployment requests GCP workload identity federation, but the server \
-                     has no [gcp-federation] configuration; set broker-role-arn and \
-                     session-name to enable it"
+                     has no [gcp-federation] configuration; set aws-role-arn and \
+                     aws-role-session-name to enable it"
                         .to_owned(),
                 );
             };
-            Broker::init(config).await.map(Arc::new)
+            AwsFederationCredentials::init(config).await.map(Arc::new)
         })
         .await
         .cloned()
@@ -422,11 +383,11 @@ impl SubjectTokenProviderError for FederationError {
 }
 
 /// Supplies the AIP-4117 AWS subject token to `google-cloud-auth`'s external-account credential
-/// on each refresh. Holds no AWS credential machinery of its own beyond a clone of the shared
-/// [`Broker`]: no `AWS_*` environment reads or writes, no process-global AWS SDK state.
+/// on each refresh. It only retains the shared [`AwsFederationCredentials`]; it does not read or
+/// write `AWS_*` environment variables or modify process-global AWS SDK state.
 #[derive(Debug)]
 struct AwsSubjectTokenProvider {
-    broker: Arc<Broker>,
+    aws_federation_credentials: Arc<AwsFederationCredentials>,
     /// The full resource name of the customer's workload identity provider. Doubles as the
     /// `x-goog-cloud-target-resource` header value that binds the signed envelope to this pool
     /// (see `build_subject_token`) and as the STS `audience` parameter.
@@ -449,10 +410,10 @@ impl SubjectTokenProvider for AwsSubjectTokenProvider {
 
 impl AwsSubjectTokenProvider {
     async fn subject_token_inner(&self) -> Result<SubjectToken, FederationError> {
-        let credentials = self.broker.credentials().await?;
+        let credentials = self.aws_federation_credentials.credentials().await?;
         let envelope = build_subject_token(
             &credentials,
-            &self.broker.region,
+            &self.aws_federation_credentials.region,
             &self.provider_resource,
             SystemTime::now(),
         )
@@ -559,7 +520,7 @@ struct SubjectTokenHeader {
 /// model.
 ///
 /// Deliberately holds no reference back to `CredentialRegistry` or any task-center-bound state:
-/// `ClearRegistrySlotOnDrop`'s `Weak`-based shutdown guard (`gcp/mod.rs`) must stay cycle-free.
+/// `ClearRegistrySlotOnDrop`'s `Weak`-based shutdown guard must stay cycle-free.
 pub(super) struct FederatedAccessTokenSource {
     pub(super) credentials: RecoverableCell<google_cloud_auth::credentials::Credentials>,
 }
@@ -577,13 +538,10 @@ pub(super) struct FederatedAccessTokenSource {
 /// nothing to observe -- an outer credential's own cloned copy of its access-token `Credentials`
 /// is invisible to this map.
 ///
-/// NOT keyed on any AWS identity: this round adds no ambient-AWS federation (the broker identity
-/// stays the single process-global, install-once [`GcpFederationOptions`]), so the WIF provider
-/// resource name alone is a sufficient key -- there is exactly one AWS identity in the process
-/// that could ever produce a subject token for a given provider. A future per-deployment AWS
-/// identity choice (e.g. an ambient/`AssumeRole` alternative to the shared broker) would have to
-/// join this key: a different AWS identity presenting itself to the same provider is a distinct
-/// access-token source, not a cache hit.
+/// The provider resource name is a sufficient key while the process has exactly one configured
+/// AWS federation identity. If deployments can later select among AWS identities, that identity
+/// must become part of the key: the same provider reached through a different AWS identity is a
+/// distinct access-token source.
 pub(super) type FederatedAccessTokenSources =
     parking_lot::Mutex<std::collections::HashMap<String, Weak<FederatedAccessTokenSource>>>;
 
@@ -671,9 +629,8 @@ pub(super) async fn build_federated_source(
 /// `Arc<FederatedAccessTokenSource>` and returns that. Concurrent cold constructions for one
 /// provider still converge on one instance despite this running under a plain lock: the work done
 /// while holding it is just `HashMap`/`Weak` bookkeeping and one cheap `RecoverableCell::new()` --
-/// the potentially slow part (the actual Google STS/broker construction) happens later, inside
-/// `RecoverableCell`'s own single-flight (see [`build_federated_source`]), never while holding
-/// this lock.
+/// the potentially slow part (AWS credential resolution and Google STS construction) happens
+/// later, inside `RecoverableCell`'s own single-flight, never while holding this lock.
 pub(super) fn federated_access_token_source(
     sources: &FederatedAccessTokenSources,
     provider: &str,
@@ -742,7 +699,7 @@ pub(super) async fn recover_federated_access_token_source_if_dead(
 /// with no live [`FederatedIdTokenCredentials`] referencing it any more -- and returns the number
 /// of entries retained (all upgradeable, hence live), for `gcp.federation.sources.active`.
 ///
-/// Called from the registry's housekeeping tick (`gcp/mod.rs`), and only ever after the caller has
+/// Called from the registry's housekeeping tick, and only after the caller has
 /// already driven the *outer* moka cache's own `run_pending_tasks`: moka evicts idle entries
 /// lazily, so an outer credential can be logically expired yet still be a live strong referent of
 /// its access-token source until that pass actually drops it. Pruning here first would remove
@@ -760,8 +717,8 @@ pub(super) fn reap_disused_federated_access_token_sources(
 
 /// Boxes [`build_federated_access_token_source`]'s future. `RecoverableCell::get_or_build`/
 /// `replace_if_failed` are small generic utilities that hold their `build` future inline across an
-/// await point; `build_federated_access_token_source` resolves the shared broker internally
-/// (`aws_config::load_defaults()`'s own future is large), so leaving it unboxed here would size
+/// await point; `build_federated_access_token_source` resolves the shared AWS credentials
+/// internally (`aws_config::load_defaults()`'s own future is large), so leaving it unboxed here would size
 /// `mint()`'s own future -- which reaches this through both `build_federated_source` and recovery
 /// -- for that on every mint, federated or not.
 fn boxed_federated_access_token_source_build(
@@ -773,9 +730,9 @@ fn boxed_federated_access_token_source_build(
 }
 
 /// Test-only override for a federated access-token source's build step, keyed by provider so
-/// distinct providers' tests cannot interfere with each other. Consulted before resolving a broker
+/// distinct providers' tests cannot interfere with each other. Consulted before resolving AWS credentials
 /// at all (see [`build_federated_access_token_source`]), so overriding tests never need
-/// `[gcp-federation]` configuration or a `Broker` in place.
+/// `[gcp-federation]` configuration or [`AwsFederationCredentials`] in place.
 #[cfg(test)]
 type FederatedAccessTokenSourceOverride =
     Arc<dyn Fn() -> Result<google_cloud_auth::credentials::Credentials, String> + Send + Sync>;
@@ -785,7 +742,7 @@ static FEDERATED_ACCESS_TOKEN_SOURCE_OVERRIDES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 /// Builds fresh access-token credentials for `provider`: the test override when compiled for
-/// tests, otherwise the real chain (resolve the shared broker, sign a SigV4 subject token,
+/// tests, otherwise the real chain (resolve the shared AWS credentials, sign a SigV4 subject token,
 /// exchange it at Google STS). Shared by [`build_federated_source`] (first build) and
 /// [`recover_federated_access_token_source_if_dead`] (rebuild after a proven-dead probe).
 async fn build_federated_access_token_source(
@@ -800,9 +757,9 @@ async fn build_federated_access_token_source(
         return f();
     }
 
-    let broker = broker().await?;
+    let aws_federation_credentials = aws_federation_credentials().await?;
     let subject_token_provider = Arc::new(AwsSubjectTokenProvider {
-        broker,
+        aws_federation_credentials,
         provider_resource: provider_resource.clone(),
     });
     ProgrammaticBuilder::new(subject_token_provider)
@@ -837,7 +794,7 @@ mod federation_tests {
 
     use super::build_subject_token;
 
-    const PROVIDER: &str = "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/restate-cloud/providers/aws-broker";
+    const PROVIDER: &str = "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/restate-cloud/providers/aws-federation";
 
     fn fixed_credentials() -> AwsCredentials {
         AwsCredentials::new(
@@ -888,7 +845,7 @@ mod federation_tests {
 
     /// The provider resource name must be covered by the signature. If it were not, a signed
     /// envelope minted for one workload identity pool could be replayed against another -- which
-    /// is the environment-isolation boundary restate-cloud#1188 requires.
+    /// is the environment-isolation boundary this authentication scheme relies on.
     #[test]
     fn target_resource_is_a_signed_header() {
         let token =
@@ -917,12 +874,12 @@ mod federation_tests {
     }
 
     // -- Tests below exercise the real `AwsSubjectTokenProvider` + `ProgrammaticBuilder` chain
-    // against a local mock Google STS server. They build a `Broker` directly (bypassing
-    // `Broker::init`'s `aws_config::load_defaults()` and the process-global `BROKER`/
+    // against a local mock Google STS server. They build a `AwsFederationCredentials` directly (bypassing
+    // `AwsFederationCredentials::init`'s `aws_config::load_defaults()` and the process-global `AWS_FEDERATION_CREDENTIALS`/
     // `FEDERATION_CONFIG` statics entirely) with a pre-cached, never-expiring credentials
-    // fixture, so `Broker::credentials()` never calls the real `sts:AssumeRole` API -- no network
+    // fixture, so `AwsFederationCredentials::credentials()` never calls the real `sts:AssumeRole` API -- no network
     // access to AWS is needed or attempted. This also means these tests never touch the shared
-    // statics `broker()` reads, so they cannot interfere with `gcp::tests`'
+    // statics `aws_federation_credentials()` reads, so they cannot interfere with `gcp::tests`'
     // `wif_requested_without_server_config_is_a_permanent_build_error`, which depends on
     // `FEDERATION_CONFIG` staying uninstalled for the lifetime of this test binary.
 
@@ -940,14 +897,12 @@ mod federation_tests {
     use hyper_util::rt::TokioIo;
     use tokio::net::TcpListener;
 
-    use super::{AWS4_SUBJECT_TOKEN_TYPE, AwsSubjectTokenProvider, Broker};
+    use super::{AWS4_SUBJECT_TOKEN_TYPE, AwsFederationCredentials, AwsSubjectTokenProvider};
 
-    /// Builds a `Broker` that never performs AWS network I/O: `provider` wraps a fixed credential
-    /// directly (see `Broker`'s doc), and the cache is pre-seeded so `Broker::credentials()`
-    /// always takes the cache-hit path.
-    fn fixture_broker() -> Arc<Broker> {
+    /// Builds pre-seeded AWS federation credentials that never perform network I/O.
+    fn fixture_aws_federation_credentials() -> Arc<AwsFederationCredentials> {
         let credentials = fixed_credentials();
-        Arc::new(Broker {
+        Arc::new(AwsFederationCredentials {
             region: "us-east-1".to_owned(),
             provider: aws_credential_types::provider::SharedCredentialsProvider::new(
                 credentials.clone(),
@@ -1023,9 +978,9 @@ mod federation_tests {
     async fn programmatic_builder_sts_exchange_matches_expected_wire_format() {
         let env_before = aws_env_snapshot();
 
-        let broker = fixture_broker();
+        let aws_federation_credentials = fixture_aws_federation_credentials();
         let subject_token_provider = Arc::new(AwsSubjectTokenProvider {
-            broker,
+            aws_federation_credentials,
             provider_resource: PROVIDER.to_owned(),
         });
 
@@ -1103,15 +1058,15 @@ mod federation_tests {
     }
 
     #[test]
-    fn accepts_a_well_formed_broker_role_arn() {
-        super::validate_broker_role_arn("arn:aws:iam::123456789012:role/RestateCloudGcpFederation")
+    fn accepts_a_well_formed_aws_role_arn() {
+        super::validate_aws_role_arn("arn:aws:iam::123456789012:role/RestateCloudGcpFederation")
             .expect("well-formed ARN accepted");
-        super::validate_broker_role_arn("arn:aws-us-gov:iam::123456789012:role/path/to/role")
+        super::validate_aws_role_arn("arn:aws-us-gov:iam::123456789012:role/path/to/role")
             .expect("non-default partition with a role path accepted");
     }
 
     #[test]
-    fn rejects_malformed_broker_role_arns() {
+    fn rejects_malformed_aws_role_arns() {
         for arn in [
             "not-an-arn",
             "arn:aws:s3::123456789012:role/wrong-service",
@@ -1122,7 +1077,7 @@ mod federation_tests {
             "arn:aws:iam::123456789012:role/",
             "arn:aws!:iam::123456789012:role/bad-partition-chars",
         ] {
-            super::validate_broker_role_arn(arn)
+            super::validate_aws_role_arn(arn)
                 .expect_err(&format!("expected '{arn}' to be rejected"));
         }
     }
@@ -1135,7 +1090,7 @@ mod federation_tests {
             "env_xyz.123@foo,bar+baz=qux",
             &"a".repeat(64),
         ] {
-            super::validate_session_name(name).expect("well-formed session name accepted");
+            super::validate_aws_role_session_name(name).expect("well-formed session name accepted");
         }
     }
 
@@ -1149,41 +1104,38 @@ mod federation_tests {
             "has/slash",
             "has#hash",
         ] {
-            super::validate_session_name(name)
+            super::validate_aws_role_session_name(name)
                 .expect_err(&format!("expected '{name}' to be rejected"));
         }
     }
 
     #[test]
-    fn install_config_rejects_invalid_broker_role_arn() {
+    fn install_config_rejects_invalid_aws_role_arn() {
         let config = super::GcpFederationOptions {
-            broker_role_arn: "not-an-arn".to_owned(),
-            session_name: "valid-session".to_owned(),
+            aws_role_arn: "not-an-arn".to_owned(),
+            aws_role_session_name: "valid-session".to_owned(),
         };
-        super::install_config(Some(config)).expect_err("invalid broker-role-arn must be rejected");
+        super::install_config(Some(config)).expect_err("invalid aws-role-arn must be rejected");
     }
 
     #[test]
     fn install_config_rejects_invalid_session_name() {
         let config = super::GcpFederationOptions {
-            broker_role_arn: "arn:aws:iam::123456789012:role/RestateCloudGcpFederation".to_owned(),
-            session_name: "has a space".to_owned(),
+            aws_role_arn: "arn:aws:iam::123456789012:role/RestateCloudGcpFederation".to_owned(),
+            aws_role_session_name: "has a space".to_owned(),
         };
-        super::install_config(Some(config)).expect_err("invalid session-name must be rejected");
+        super::install_config(Some(config))
+            .expect_err("invalid aws-role-session-name must be rejected");
     }
 
-    fn fixture_config(broker_role_arn: &str) -> super::GcpFederationOptions {
+    fn fixture_config(aws_role_arn: &str) -> super::GcpFederationOptions {
         super::GcpFederationOptions {
-            broker_role_arn: broker_role_arn.to_owned(),
-            session_name: "session".to_owned(),
+            aws_role_arn: aws_role_arn.to_owned(),
+            aws_role_session_name: "session".to_owned(),
         }
     }
 
-    /// Pins the four outcomes of comparing an incoming config against whatever is already
-    /// installed, decoupled from the process-global `FEDERATION_CONFIG` cell -- this must fail if
-    /// a regression brings back the differing-config `Err` this cleanup round replaced (F1), or if
-    /// a future change makes a differing re-install silently keep the old value without at least
-    /// returning a distinguishable outcome to log from.
+    /// Exercise config comparison without mutating the process-global cell.
     #[test]
     fn decide_config_install_outcomes() {
         let a = fixture_config("arn:aws:iam::123456789012:role/A");
@@ -1215,28 +1167,24 @@ mod federation_tests {
     fn describe_config_diff_names_only_the_changed_field() {
         let a = fixture_config("arn:aws:iam::123456789012:role/A");
         let mut session_changed = a.clone();
-        session_changed.session_name = "different-session".to_owned();
+        session_changed.aws_role_session_name = "different-session".to_owned();
 
         let diff = super::describe_config_diff(&a, &session_changed);
         assert!(
-            diff.contains("session-name") && !diff.contains("broker-role-arn"),
-            "a session-name-only change must not also report broker-role-arn as changed: {diff}"
+            diff.contains("aws-role-session-name") && !diff.contains("aws-role-arn"),
+            "an aws-role-session-name-only change must not report aws-role-arn: {diff}"
         );
 
         let b = fixture_config("arn:aws:iam::123456789012:role/B");
         let diff = super::describe_config_diff(&a, &b);
         assert!(
-            diff.contains("broker-role-arn") && !diff.contains("session-name"),
-            "a broker-role-arn-only change must not also report session-name as changed: {diff}"
+            diff.contains("aws-role-arn") && !diff.contains("aws-role-session-name"),
+            "an aws-role-arn-only change must not report aws-role-session-name: {diff}"
         );
     }
 
-    /// A differing re-install through the public `install_config` entry point -- reached on every
-    /// config live-reload -- must return `Ok`, not fail `become_leader` process-wide the way an
-    /// `Err` here did before this cleanup round (F1). Runs in its own `nextest` process, so
-    /// installing a real config here cannot affect `gcp::tests::
-    /// wif_requested_without_server_config_is_a_permanent_build_error`, which depends on
-    /// `FEDERATION_CONFIG` staying uninstalled for its own process's lifetime.
+    /// A differing live-reload must keep the installed value without failing the caller. This
+    /// runs in its own nextest process because it mutates process-global configuration.
     #[test]
     fn install_config_logs_and_keeps_the_original_on_a_differing_reinstall() {
         super::install_config(Some(fixture_config(
@@ -1249,11 +1197,8 @@ mod federation_tests {
         .expect("a differing re-install must not fail the caller");
     }
 
-    /// An invalid config on a *differing* reinstall must never reach validation at all (F2):
-    /// validating a value that's going to be discarded regardless of its own shape would let a
-    /// malformed live reload fail the caller a second time -- resurrecting the exact failure mode
-    /// the warn-and-keep semantics above exist to eliminate. Runs in its own nextest process (see
-    /// the differing-reinstall test above for why that matters).
+    /// An invalid replacement is still ignored: validating a value that cannot take effect would
+    /// fail the caller without changing the active configuration.
     #[test]
     fn install_config_ignores_an_invalid_differing_reinstall() {
         super::install_config(Some(fixture_config(
@@ -1262,23 +1207,21 @@ mod federation_tests {
         .expect("first install succeeds");
 
         super::install_config(Some(super::GcpFederationOptions {
-            broker_role_arn: "not-an-arn".to_owned(),
-            session_name: "session".to_owned(),
+            aws_role_arn: "not-an-arn".to_owned(),
+            aws_role_session_name: "session".to_owned(),
         }))
         .expect("an invalid differing reload must not fail the caller");
 
         assert_eq!(
             super::FEDERATION_CONFIG
                 .get()
-                .map(|c| c.broker_role_arn.as_str()),
+                .map(|c| c.aws_role_arn.as_str()),
             Some("arn:aws:iam::123456789012:role/Original"),
             "the original config must remain installed after an invalid differing reload"
         );
     }
 
-    /// Removing the `[gcp-federation]` block on a live reload is an unapplied change too, exactly
-    /// like a differing value (F2 related) -- it must not be silently classified as
-    /// `NotRequested`, and the caller must not fail.
+    /// Removing the block on live reload is ignored like any other unsupported change.
     #[test]
     fn install_config_ignores_a_block_removed_on_reload() {
         super::install_config(Some(fixture_config(
@@ -1291,7 +1234,7 @@ mod federation_tests {
         assert_eq!(
             super::FEDERATION_CONFIG
                 .get()
-                .map(|c| c.broker_role_arn.as_str()),
+                .map(|c| c.aws_role_arn.as_str()),
             Some("arn:aws:iam::123456789012:role/Original"),
             "the original config must remain installed after the block is removed on reload"
         );
