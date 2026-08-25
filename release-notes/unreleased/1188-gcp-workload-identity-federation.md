@@ -12,9 +12,12 @@ token by assuming a shared, operator-configured AWS IAM role (the "broker" role)
 `GetCallerIdentity` request as that session, exchanging it at the customer's Google STS workload
 identity provider, and impersonating the customer's invocation service account via IAM Credentials
 `generateIdToken` -- instead of using its ambient Application Default Credentials. The broker role
-assumption is shared by the whole process, not one per deployment; construction, refresh, idle
-eviction, and error handling reuse the same credential registry every other GCP ID-token path
-already uses (restatedev/restate#5151).
+assumption is shared by the whole process, not one per deployment; construction, refresh, and error
+handling reuse the same credential registry every other GCP ID-token path already uses
+(restatedev/restate#5151). Each customer's shared Google access-token source is weak-indexed by
+workload identity provider and kept alive by every deployment's outer ID-token credential that
+references it, not by an independent idle timer -- it is reaped once the last such credential
+expires from the outer cache.
 
 ### Configuration
 

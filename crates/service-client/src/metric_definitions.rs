@@ -25,9 +25,15 @@ pub(crate) const GCP_CREDENTIALS_ACTIVE: &str = "restate.service_client.gcp.cred
 pub(crate) const GCP_FEDERATION_SUBJECT_TOKENS: &str =
     "restate.service_client.gcp.federation.subject_tokens.total";
 /// The per-provider twin of [`GCP_CREDENTIALS_ACTIVE`]: the population of shared federated
-/// external-account sources, one per WIF provider resource in `federated_sources`. Set on the same
-/// housekeeping tick as `GCP_CREDENTIALS_ACTIVE` and after each source build, so unbounded growth
-/// here (a leak, or providers accumulating instead of being evicted) is visible the same way.
+/// access-token sources, one per WIF provider resource in `federated_access_token_sources`. Set
+/// only on the registry's housekeeping tick, after that tick's own reap pass -- unlike
+/// `GCP_CREDENTIALS_ACTIVE`, there is no separate after-each-build update site any more: a
+/// provider's access-token source is weak-indexed and leased by every outer credential that
+/// references it, not time-evicted, so its count can only meaningfully change when housekeeping
+/// prunes dead leases, not on every build. Approximate for the same reason
+/// `GCP_CREDENTIALS_ACTIVE` is (and then some): an access-token source can go fully unreferenced
+/// and still count as active here until the next housekeeping tick reaps it, so this can lag an
+/// actual removal by up to one housekeeping interval.
 pub(crate) const GCP_FEDERATION_SOURCES_ACTIVE: &str =
     "restate.service_client.gcp.federation.sources.active";
 
@@ -90,6 +96,9 @@ pub(crate) fn describe_metrics() {
     describe_gauge!(
         GCP_FEDERATION_SOURCES_ACTIVE,
         Unit::Count,
-        "Number of GCP workload identity federation external-account sources currently cached, one per provider"
+        "Number of GCP workload identity federation access-token sources currently live, one per \
+         provider. Approximate: leased by outer credentials rather than time-evicted, and updated \
+         only on the housekeeping tick, so this can lag an actual removal by up to one \
+         housekeeping interval"
     );
 }

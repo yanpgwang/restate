@@ -28,9 +28,10 @@
 //! deployment's own `workload_identity_provider` and `impersonate_service_account`.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
+use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_config::sts::AssumeRoleProvider;
 use aws_credential_types::Credentials as AwsCredentials;
@@ -43,17 +44,15 @@ use google_cloud_auth::credentials::subject_token::{
     Builder as SubjectTokenBuilder, SubjectToken, SubjectTokenProvider,
 };
 use google_cloud_auth::errors::SubjectTokenProviderError;
-use metrics::{counter, gauge};
+use metrics::counter;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::warn;
 
 use restate_types::config::GcpFederationOptions;
 
-use crate::metric_definitions::{
-    GCP_FEDERATION_SOURCES_ACTIVE, GCP_FEDERATION_SUBJECT_TOKENS, RESULT_ERROR, RESULT_SUCCESS,
-};
+use crate::metric_definitions::{GCP_FEDERATION_SUBJECT_TOKENS, RESULT_ERROR, RESULT_SUCCESS};
 
-use super::{GcpAuthError, IdTokenSource, IdTokenSpec, Live, RecoverableCell};
+use super::{GcpAuthError, IdTokenSource, IdTokenSpec, RecoverableCell};
 
 /// AWS subject-token type Google STS expects for a SigV4-signed `GetCallerIdentity` envelope.
 const AWS4_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:aws:token-type:aws4_request";
@@ -72,8 +71,8 @@ const BROKER_REFRESH_MARGIN: Duration = Duration::from_secs(300);
 /// configuration can only ever come from the operator, never from a deployment registration.
 ///
 /// Stays a plain process-wide static rather than moving onto `CredentialRegistry` alongside
-/// `federated_sources`: this is install-once operator configuration for the whole process, not
-/// state tied to any one task center's runtime, so a task center replacement (see
+/// `federated_access_token_sources`: this is install-once operator configuration for the whole
+/// process, not state tied to any one task center's runtime, so a task center replacement (see
 /// `credential_registry`'s doc in `gcp/mod.rs`) has nothing here that could go stale.
 ///
 /// **Not live-reloadable.** Restate live-reloads its config file, but a `Broker` built from this
@@ -554,30 +553,81 @@ struct SubjectTokenHeader {
     value: String,
 }
 
-/// The shared federated external-account source map, keyed by WIF provider resource name: one
-/// [`RecoverableCell`] per provider, each holding the shared credential every federated key
-/// targeting that provider clones. Owned by `CredentialRegistry` (see that struct's
-/// `federated_sources` field in `gcp/mod.rs`), not a module-level static here, since a source's
-/// refresh task is spawned on whichever task center's default runtime built it and so must be
-/// rebuilt, not reused, across a task center replacement -- the same reasoning that keeps the
-/// registry's outer `cache`/`ambient_source` there rather than in statics.
+/// The shared Google STS access-token source for one WIF provider: the external-account
+/// credential produced by exchanging a SigV4-signed AWS subject token, before impersonation.
 ///
-/// A plain map, not a moka cache with its own eviction: see the `federated_sources` field's doc
-/// for why a source's slot must never be independently time-evicted.
-type FederatedSources = parking_lot::Mutex<
-    std::collections::HashMap<
-        String,
-        Arc<RecoverableCell<google_cloud_auth::credentials::Credentials>>,
-    >,
->;
+/// Lifetime is entirely reference-driven, not time-driven. Every [`FederatedIdTokenCredentials`]
+/// built for this provider holds an `Arc` to the *same* `FederatedAccessTokenSource` (see that
+/// type's `_access_token_source` field) for as long as it itself is cached; nothing here can
+/// observe that use directly, since `credentials.get_or_build()` hands back a *clone* of the
+/// underlying `Credentials` value, not a reference into this struct -- an earlier version of this
+/// type tried to track liveness with its own idle timer anyway, and that was wrong (see
+/// `FederatedAccessTokenSources`'s doc for why). So liveness is tracked the only way it validly
+/// can be: externally, by how many outer credentials still hold a strong `Arc` to this struct,
+/// via `Arc::strong_count`.
+///
+/// Deliberately holds no reference back to `CredentialRegistry` or any task-center-bound state:
+/// `ClearRegistrySlotOnDrop`'s `Weak`-based shutdown guard (`gcp/mod.rs`) must stay cycle-free.
+pub(super) struct FederatedAccessTokenSource {
+    pub(super) credentials: RecoverableCell<google_cloud_auth::credentials::Credentials>,
+}
+
+/// Weak-indexed by WIF provider resource name. The map itself never holds a strong reference, so
+/// it never has anything to time out: [`federated_access_token_source`] upgrades an entry while
+/// it's live or replaces it (absent or dead) with a fresh one, and
+/// [`reap_disused_federated_access_token_sources`] prunes whatever no longer upgrades. This is the
+/// deliberate replacement for an earlier version of this map, which held `Arc<RecoverableCell<_>>`
+/// directly and depended on a moka time-to-idle policy to age out abandoned providers -- that was
+/// wrong because this map is only ever touched from *outer* construction, never from a
+/// steady-state mint against an already-built outer credential, so an idle timer here can't
+/// observe the very thing that keeps a source alive (an outer credential's own cloned copy of its
+/// `Credentials`). Weak-indexing sidesteps the whole problem: there is no independent timer to get
+/// wrong, only the true refcount.
+///
+/// NOT keyed on any AWS identity: this round adds no ambient-AWS federation (the broker identity
+/// stays the single process-global, install-once [`GcpFederationOptions`]), so the WIF provider
+/// resource name alone is a sufficient key -- there is exactly one AWS identity in the process
+/// that could ever produce a subject token for a given provider. A future per-deployment AWS
+/// identity choice (e.g. an ambient/`AssumeRole` alternative to the shared broker) would have to
+/// join this key: a different AWS identity presenting itself to the same provider is a distinct
+/// access-token source, not a cache hit.
+pub(super) type FederatedAccessTokenSources =
+    parking_lot::Mutex<std::collections::HashMap<String, Weak<FederatedAccessTokenSource>>>;
+
+/// The outer, per-audience/service-account federated ID-token credential. Exists so the federated
+/// construction path cannot forget to keep its access-token source's lease alive: `Live` (used by
+/// the ambient/impersonated paths) has no such field, because the shared ambient source's lifetime
+/// is tracked by the registry itself, not by any individual outer credential -- but a federated
+/// access-token source's lifetime is tracked *entirely* by how many `FederatedIdTokenCredentials`
+/// still hold a strong `Arc` to it. Making this a distinct type rather than an optional field on
+/// `Live` makes omitting the lease a compile error in the federated path, not a runtime bug.
+pub(super) struct FederatedIdTokenCredentials {
+    credentials: google_cloud_auth::credentials::idtoken::IDTokenCredentials,
+    // Keeps the Google STS access-token source and its refresh task alive for at least as long as
+    // this outer ID-token credential stays cached. Dropping this (when the outer moka cache
+    // evicts the entry this credential lives in) is what lets
+    // `reap_disused_federated_access_token_sources` observe that the access-token source has no
+    // more referents.
+    _access_token_source: Arc<FederatedAccessTokenSource>,
+}
+
+#[async_trait]
+impl IdTokenSource for FederatedIdTokenCredentials {
+    async fn id_token(&self) -> Result<String, google_cloud_auth::errors::CredentialsError> {
+        self.credentials.id_token().await
+    }
+}
 
 /// Assembles the federation chain for `spec` (whose `wif_provider` is `Some`) and returns the
-/// resulting [`IdTokenSource`]: broker credentials -> shared external-account source credential
-/// -> impersonation. Only the outer impersonated credential built here is per-key; the
-/// external-account source is shared per WIF provider (see [`external_account_source`]) exactly
-/// like the registry's ambient source is shared across impersonated keys.
+/// resulting [`FederatedIdTokenCredentials`]: (1) resolve this provider's shared
+/// [`FederatedAccessTokenSource`] from `sources`; (2) resolve or build its access-token
+/// credentials through that source's [`RecoverableCell`] (single-flighted, so N concurrent cold
+/// keys for one provider share one build); (3) build the impersonated ID-token credential from the
+/// *cloned* access-token credentials; (4) return both together. Never clones the access-token
+/// credentials out and discards the `Arc<FederatedAccessTokenSource>` from step 1 -- holding that
+/// lease is the entire point.
 pub(super) async fn build_federated_source(
-    sources: &FederatedSources,
+    sources: &FederatedAccessTokenSources,
     spec: IdTokenSpec,
 ) -> Result<Arc<dyn IdTokenSource>, GcpAuthError> {
     let IdTokenSpec {
@@ -599,7 +649,12 @@ pub(super) async fn build_federated_source(
         });
     };
 
-    let source = external_account_source(sources, &wif_provider)
+    let access_token_source = federated_access_token_source(sources, &wif_provider);
+    let access_token_credentials = access_token_source
+        .credentials
+        .get_or_build(boxed_federated_access_token_source_build(
+            wif_provider.clone(),
+        ))
         .await
         .map_err(|message| GcpAuthError::Adc {
             audience: audience.clone(),
@@ -610,7 +665,7 @@ pub(super) async fn build_federated_source(
     let credentials = idtoken::impersonated::Builder::from_source_credentials(
         audience.clone(),
         impersonate,
-        source,
+        access_token_credentials,
     )
     .build()
     .map_err(|e| GcpAuthError::Build {
@@ -618,62 +673,70 @@ pub(super) async fn build_federated_source(
         message: e.to_string(),
     })?;
 
-    Ok(Arc::new(Live(credentials)) as Arc<dyn IdTokenSource>)
+    Ok(Arc::new(FederatedIdTokenCredentials {
+        credentials,
+        _access_token_source: access_token_source,
+    }) as Arc<dyn IdTokenSource>)
 }
 
-/// Returns the [`RecoverableCell`] for `provider` in `sources`, creating an empty one on first
-/// reference. `sources` never evicts entries (see the `federated_sources` field's doc in
-/// `gcp/mod.rs`), so once created a provider's cell lives for the owning registry's lifetime.
-pub(super) async fn external_account_source_slot(
-    sources: &FederatedSources,
+/// Atomic lookup-or-create under `sources`' lock: upgrades `provider`'s existing entry if it's
+/// still live, or replaces it (whether absent or dead) with a freshly constructed
+/// `Arc<FederatedAccessTokenSource>` and returns that. Concurrent cold constructions for one
+/// provider still converge on one instance despite this running under a plain lock: the work done
+/// while holding it is just `HashMap`/`Weak` bookkeeping and one cheap `RecoverableCell::new()` --
+/// the potentially slow part (the actual Google STS/broker construction) happens later, inside
+/// `RecoverableCell`'s own single-flight (see [`build_federated_source`]), never while holding
+/// this lock.
+pub(super) fn federated_access_token_source(
+    sources: &FederatedAccessTokenSources,
     provider: &str,
-) -> Arc<RecoverableCell<google_cloud_auth::credentials::Credentials>> {
-    sources
-        .lock()
-        .entry(provider.to_owned())
-        .or_insert_with(|| Arc::new(RecoverableCell::new()))
-        .clone()
-}
-
-/// Returns `provider`'s shared external-account source credential from `sources`, building it on
-/// first use and reusing it thereafter -- single-flighted by the provider's [`RecoverableCell`],
-/// so N concurrent cold federated keys for the same provider share one build. Recovery from a
-/// permanent post-build failure is driven separately (see [`recover_federated_source_if_dead`]).
-async fn external_account_source(
-    sources: &FederatedSources,
-    provider: &str,
-) -> Result<google_cloud_auth::credentials::Credentials, String> {
-    let result = external_account_source_slot(sources, provider)
-        .await
-        .get_or_build(boxed_external_account_source_build(provider.to_owned()))
-        .await;
-    if result.is_ok() {
-        gauge!(GCP_FEDERATION_SOURCES_ACTIVE).set(sources.lock().len() as f64);
+) -> Arc<FederatedAccessTokenSource> {
+    let mut sources = sources.lock();
+    if let Some(existing) = sources.get(provider).and_then(Weak::upgrade) {
+        return existing;
     }
-    result
+    let fresh = Arc::new(FederatedAccessTokenSource {
+        credentials: RecoverableCell::new(),
+    });
+    sources.insert(provider.to_owned(), Arc::downgrade(&fresh));
+    fresh
 }
 
-/// Probes `provider`'s cached external-account source credential in `sources` and replaces it if
-/// -- and only if -- the probe proves its background refresh task has permanently died, mirroring
+/// Probes `provider`'s access-token source credentials and replaces them if -- and only if -- the
+/// probe proves their background refresh task has permanently died, mirroring
 /// `CredentialRegistry::recover_ambient_source_if_dead` exactly. Called from `mint()` after any
 /// permanent mint failure on a federated key targeting `provider`.
-pub(super) async fn recover_federated_source_if_dead(sources: &FederatedSources, provider: &str) {
-    match external_account_source_slot(sources, provider)
-        .await
+///
+/// Deliberately upgrades rather than looking up via [`federated_access_token_source`], and is a
+/// no-op if the entry is absent or already dead: a dead weak entry here means no live outer
+/// credential needs this provider's source any more (the caller's own `mint()` still holds one
+/// strong reference for the duration of this call -- see the module-level recovery/reap race
+/// invariant below -- so "dead" here can only mean genuinely unreferenced), and creating one
+/// afresh only to immediately have nothing reference it would just hand
+/// [`reap_disused_federated_access_token_sources`] a tombstone to prune next tick for no reason.
+/// The next real outer construction creates a fresh source on its own via
+/// [`federated_access_token_source`] regardless.
+pub(super) async fn recover_federated_access_token_source_if_dead(
+    sources: &FederatedAccessTokenSources,
+    provider: &str,
+) {
+    let Some(access_token_source) = sources.lock().get(provider).and_then(Weak::upgrade) else {
+        return;
+    };
+    match access_token_source
+        .credentials
         .replace_if_failed(
             super::credentials_source_is_dead,
-            boxed_external_account_source_build(provider.to_owned()),
+            boxed_federated_access_token_source_build(provider.to_owned()),
         )
         .await
     {
         Ok(true) => {
-            gauge!(GCP_FEDERATION_SOURCES_ACTIVE).set(sources.lock().len() as f64);
-            // `provider_resource` is a log field, not a metric label -- see
-            // GCP_FEDERATION_SOURCES_ACTIVE's doc for why the provider dimension never appears on
-            // a metric.
+            // `provider_resource` is a log field, not a metric label -- provider cardinality is
+            // unbounded from this crate's point of view, so it must never appear on a metric.
             warn!(
                 provider_resource = %provider,
-                "replaced a federated GCP external-account source: its refresh task was proven dead"
+                "replaced a federated GCP access-token source: its refresh task was proven dead"
             );
         }
         Ok(false) => {}
@@ -681,48 +744,68 @@ pub(super) async fn recover_federated_source_if_dead(sources: &FederatedSources,
             warn!(
                 provider_resource = %provider,
                 error = %error,
-                "failed to rebuild a federated GCP external-account source after its refresh \
-                 task was proven dead; a future mint attempt will retry"
+                "failed to rebuild a federated GCP access-token source after its refresh task \
+                 was proven dead; a future mint attempt will retry"
             );
         }
     }
 }
 
-/// Boxes [`build_external_account_source`]'s future. `RecoverableCell::get_or_build`/
+/// Prunes `sources` of every entry whose weak reference no longer upgrades -- i.e. every provider
+/// with no live [`FederatedIdTokenCredentials`] referencing it any more -- and returns the number
+/// of entries retained (all upgradeable, hence live), for `gcp.federation.sources.active`.
+///
+/// Called from the registry's housekeeping tick (`gcp/mod.rs`), and only ever after the caller has
+/// already driven the *outer* moka cache's own `run_pending_tasks`: moka evicts idle entries
+/// lazily, so an outer credential can be logically expired yet still be a live strong referent of
+/// its access-token source until that pass actually drops it. Pruning here first would remove
+/// sources whose only referent simply hasn't been dropped yet, not sources that are actually
+/// unreferenced -- and since this pass runs once per `CACHE_HOUSEKEEPING_INTERVAL`, an
+/// already-unreferenced source can also sit here for up to one more interval before this catches
+/// it; `gcp.federation.sources.active` is documented as approximate for exactly that reason.
+pub(super) fn reap_disused_federated_access_token_sources(
+    sources: &FederatedAccessTokenSources,
+) -> usize {
+    let mut sources = sources.lock();
+    sources.retain(|_, weak| weak.strong_count() > 0);
+    sources.len()
+}
+
+/// Boxes [`build_federated_access_token_source`]'s future. `RecoverableCell::get_or_build`/
 /// `replace_if_failed` are small generic utilities that hold their `build` future inline across an
-/// await point; `build_external_account_source` resolves the shared broker internally
+/// await point; `build_federated_access_token_source` resolves the shared broker internally
 /// (`aws_config::load_defaults()`'s own future is large), so leaving it unboxed here would size
-/// `mint()`'s own future -- which reaches this through both `external_account_source` and
-/// recovery -- for that on every mint, federated or not.
-fn boxed_external_account_source_build(
+/// `mint()`'s own future -- which reaches this through both `build_federated_source` and recovery
+/// -- for that on every mint, federated or not.
+fn boxed_federated_access_token_source_build(
     provider_resource: String,
 ) -> std::pin::Pin<
     Box<dyn Future<Output = Result<google_cloud_auth::credentials::Credentials, String>> + Send>,
 > {
-    Box::pin(build_external_account_source(provider_resource))
+    Box::pin(build_federated_access_token_source(provider_resource))
 }
 
-/// Test-only override for [`external_account_source`]'s build step, keyed by provider so distinct
-/// providers' tests cannot interfere with each other. Consulted before resolving a broker at all
-/// (see [`build_external_account_source`]), so overriding tests never need `[gcp-federation]`
-/// configuration or a `Broker` in place.
+/// Test-only override for a federated access-token source's build step, keyed by provider so
+/// distinct providers' tests cannot interfere with each other. Consulted before resolving a broker
+/// at all (see [`build_federated_access_token_source`]), so overriding tests never need
+/// `[gcp-federation]` configuration or a `Broker` in place.
 #[cfg(test)]
-type FederatedSourceOverride =
+type FederatedAccessTokenSourceOverride =
     Arc<dyn Fn() -> Result<google_cloud_auth::credentials::Credentials, String> + Send + Sync>;
 #[cfg(test)]
-static FEDERATED_SOURCE_OVERRIDES: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<String, FederatedSourceOverride>>,
+static FEDERATED_ACCESS_TOKEN_SOURCE_OVERRIDES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, FederatedAccessTokenSourceOverride>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// Builds a fresh external-account source credential for `provider`: the test override when
-/// compiled for tests, otherwise the real chain (resolve the shared broker, sign a SigV4 subject
-/// token, exchange it at Google STS). Shared by `external_account_source` (first build) and
-/// `recover_federated_source_if_dead` (rebuild after a proven-dead probe).
-async fn build_external_account_source(
+/// Builds fresh access-token credentials for `provider`: the test override when compiled for
+/// tests, otherwise the real chain (resolve the shared broker, sign a SigV4 subject token,
+/// exchange it at Google STS). Shared by [`build_federated_source`] (first build) and
+/// [`recover_federated_access_token_source_if_dead`] (rebuild after a proven-dead probe).
+async fn build_federated_access_token_source(
     provider_resource: String,
 ) -> Result<google_cloud_auth::credentials::Credentials, String> {
     #[cfg(test)]
-    if let Some(f) = FEDERATED_SOURCE_OVERRIDES
+    if let Some(f) = FEDERATED_ACCESS_TOKEN_SOURCE_OVERRIDES
         .lock()
         .get(&provider_resource)
         .cloned()
@@ -743,16 +826,17 @@ async fn build_external_account_source(
         .map_err(|e| format!("building GCP workload identity federation source credentials: {e}"))
 }
 
-/// Test-only: install `f` as the build step for `provider`'s shared external-account source (see
-/// [`FEDERATED_SOURCE_OVERRIDES`]). `f` returns a `google_cloud_auth::credentials::Credentials`
-/// directly -- a fully public type -- so callers outside this module (e.g. `gcp::tests`) can
-/// install one without needing to see anything internal to federation.
+/// Test-only: install `f` as the build step for `provider`'s shared access-token source (see
+/// [`FEDERATED_ACCESS_TOKEN_SOURCE_OVERRIDES`]). `f` returns a
+/// `google_cloud_auth::credentials::Credentials` directly -- a fully public type -- so callers
+/// outside this module (e.g. `gcp::tests`) can install one without needing to see anything
+/// internal to federation.
 #[cfg(test)]
-pub(super) fn install_federated_source_override_for_test(
+pub(super) fn install_federated_access_token_source_override_for_test(
     provider: &str,
     f: impl Fn() -> Result<google_cloud_auth::credentials::Credentials, String> + Send + Sync + 'static,
 ) {
-    FEDERATED_SOURCE_OVERRIDES
+    FEDERATED_ACCESS_TOKEN_SOURCE_OVERRIDES
         .lock()
         .insert(provider.to_owned(), Arc::new(f));
 }
@@ -1287,26 +1371,34 @@ mod federation_tests {
         );
     }
 
-    /// `federated_sources` is a plain, registry-lifetime map with no eviction (F1): unlike an
-    /// earlier version of this type (a moka cache sharing the outer registry cache's time-to-idle
-    /// policy), a provider's slot must survive indefinitely once created -- an outer credential
-    /// holds its source credential alive internally, invisible to this map, so idle-evicting the
-    /// slot while an outer credential built from it was still alive would silently rebuild a
-    /// second, colliding source next time the same provider was referenced. Proven structurally
-    /// here: two lookups for the same provider, with nothing in between, must return the exact
-    /// same slot; see `gcp::tests::federated_source_is_reused_across_idle_time_while_referenced`
-    /// for the end-to-end version through `mint()`.
-    #[tokio::test]
-    async fn external_account_source_slot_is_reused_on_every_lookup() {
-        let provider = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/reuse-test";
-        let sources: super::FederatedSources = Default::default();
+    /// `federated_access_token_sources` is weak-indexed, not time-evicted (see that type's doc):
+    /// while a provider's `FederatedAccessTokenSource` is live, every lookup must upgrade to the
+    /// exact same instance -- never rebuild. Once every strong reference to it drops (simulated
+    /// here directly, without any outer credential involved), the entry is a dead tombstone the
+    /// *next* lookup must replace with a fresh instance, never resurrect. Housekeeping's own
+    /// pruning of that tombstone is covered separately, in `gcp::tests`, through the full
+    /// production construction path.
+    #[test]
+    fn federated_access_token_source_upgrades_while_live_and_replaces_once_dead() {
+        let provider = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/lookup-test";
+        let sources: super::FederatedAccessTokenSources = Default::default();
 
-        let first = super::external_account_source_slot(&sources, provider).await;
-        let second = super::external_account_source_slot(&sources, provider).await;
-
+        let first = super::federated_access_token_source(&sources, provider);
+        let second = super::federated_access_token_source(&sources, provider);
         assert!(
             Arc::ptr_eq(&first, &second),
-            "the same provider must always resolve to the same slot -- this map has no eviction"
+            "a live provider must always resolve to the same access-token source"
+        );
+
+        let dead_ptr = Arc::as_ptr(&first);
+        drop(first);
+        drop(second);
+        let third = super::federated_access_token_source(&sources, provider);
+        assert_ne!(
+            Arc::as_ptr(&third),
+            dead_ptr,
+            "once every strong reference drops, the next lookup must replace the tombstone with \
+             a fresh instance, never resurrect the dead one"
         );
     }
 }
